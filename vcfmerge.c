@@ -75,7 +75,7 @@ info_rule_t;
 typedef struct
 {
     int skip;
-    int *map;   // mapping from input alleles to the output array
+    int *map;   // mapping from input alleles of a sample to the output array of the combined allele array
     int mmap;   // size of map array (only buffer[i].n_allele is actually used)
     int als_differ;
 }
@@ -84,6 +84,8 @@ typedef struct
 {
     int n;  // number of readers
     char **als, **out_als;  // merged alleles (temp, may contain empty records) and merged alleles ready for output
+    //nals : number of valid alleles in array als
+    //mals : number of entries available in array als (some of them could be invalid)
     int nals, mals, nout_als, mout_als; // size of the output array
     int *cnt, ncnt; // number of records that refer to the alleles
     int *nbuf;      // readers have buffers of varying lengths
@@ -498,7 +500,7 @@ void normalize_alleles(char **als, int nals)
  * @na:     number of $a alleles
  * @map:    map from the original $a indexes to new $b indexes (0-based)
  * @b:      alleles to be merged, the array will be expanded as required
- * @nb:     number of $b alleles
+ * @nb:     number of $b alleles (ptr because this int will be changed)
  * @mb:     size of $b
  *
  * Returns NULL on error or $b expanded to incorporate $a alleles and sets
@@ -685,7 +687,7 @@ void merge_chrom2qual(args_t *args, bcf1_t *out)
     out->pos = -1;
     for (i=0; i<files->nreaders; i++)
     {
-        if ( !ma->has_line[i] ) continue;
+        if ( !ma->has_line[i] ) continue;       //set in merge_buffer
 
         bcf_sr_t *reader = &files->readers[i];
         bcf1_t *line = reader->buffer[0];
@@ -731,7 +733,7 @@ void merge_chrom2qual(args_t *args, bcf1_t *out)
 
     // set alleles
     ma->nout_als = 0;
-    for (i=1; i<ma->nals; i++)
+    for (i=1; i<ma->nals; i++)  //0 is reference
     {
         if ( !al_idxs[i] ) continue;
         ma->nout_als++;
@@ -743,7 +745,7 @@ void merge_chrom2qual(args_t *args, bcf1_t *out)
         {
             if ( !ma->has_line[ir] ) continue;
             bcf1_t *line = files->readers[ir].buffer[0];
-            for (j=1; j<line->n_allele; j++)
+            for (j=1; j<line->n_allele; j++)    //0 is reference
                 if ( ma->d[ir][0].map[j]==i ) ma->d[ir][0].map[j] = ma->nout_als;
         }
     }
@@ -786,6 +788,7 @@ void merge_filter(args_t *args, bcf1_t *out)
         {
             const char *flt = hdr->id[BCF_DT_ID][line->d.flt[k]].key;
             kitr = kh_get(strdict, tmph, flt);
+            //if filter not already added, add
             if ( kitr == kh_end(tmph) )
             {
                 int id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, flt);
@@ -1019,7 +1022,7 @@ void merge_info(args_t *args, bcf1_t *out)
     maux_t *ma = args->maux;
     ma->nAGR_info = 0;
     out->n_info   = 0;
-    info_rules_reset(args);
+    info_rules_reset(args);     //zero out everything
     for (i=0; i<files->nreaders; i++)
     {
         if ( !ma->has_line[i] ) continue;
@@ -1048,7 +1051,7 @@ void merge_info(args_t *args, bcf1_t *out)
                 }
             }
 
-            // Todo: Number=AGR tags should use the newer info_rules_* functions (info_rules_merge_first to be added)
+            // TODO: Number=AGR tags should use the newer info_rules_* functions (info_rules_merge_first to be added)
             // and merge_AGR_info_tag to be made obsolete.
             if ( len==BCF_VL_A || len==BCF_VL_G || len==BCF_VL_R  ) // Number=R,G,A requires special treatment
             {
@@ -1452,6 +1455,8 @@ void merge_format(args_t *args, bcf1_t *out)
     strdict_t *tmph = args->tmph;
     kh_clear(strdict, tmph);
     int i, j, ret, has_GT = 0, max_ifmt = 0; // max fmt index
+
+    //Get all format fields and collect info about allele re-numbering for every sample
     for (i=0; i<files->nreaders; i++)
     {
         if ( !ma->has_line[i] ) continue;
@@ -1488,7 +1493,7 @@ void merge_format(args_t *args, bcf1_t *out)
             ma->fmt_map[ifmt*files->nreaders+i] = fmt;
         }
         // Check if the allele numbering must be changed
-        for (j=1; j<reader->buffer[0]->n_allele; j++)
+        for (j=1; j<reader->buffer[0]->n_allele; j++)   //0 is reference
             if ( ma->d[i][0].map[j]!=j ) break;
         ma->d[i][0].als_differ = j==reader->buffer[0]->n_allele ? 0 : 1;
     }
@@ -1695,7 +1700,7 @@ void merge_buffer(args_t *args)
             break;
         }
     }
-
+    //TODO - iterate using minimum position and only those with minimum
     // In this loop we select from each reader compatible candidate lines.
     // (i.e. SNPs or indels). Go through all files and all lines at this
     // position and normalize relevant alleles.
@@ -1740,6 +1745,7 @@ void merge_buffer(args_t *args)
             }
             maux->d[i][j].skip = 0;
 
+            //realloc
             hts_expand(int, line->n_allele, maux->d[i][j].mmap, maux->d[i][j].map);
             if ( !maux->nals )    // first record, copy the alleles to the output
             {
