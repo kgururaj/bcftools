@@ -1135,17 +1135,19 @@ void merge_GT(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
     bcf_hdr_t *out_hdr = args->out_hdr;
     maux_t *ma = args->maux;
     int i, ismpl = 0, nsamples = bcf_hdr_nsamples(out_hdr);
-
-    int nsize = 0, msize = sizeof(int32_t);
+   
+    //nsize - max entries per sample (max ploidy here)
+    //see definition of fmt_map for why nsize is ploidy
+    int max_ploidy = 0, msize = sizeof(int32_t);
     for (i=0; i<files->nreaders; i++)
     {
         if ( !fmt_map[i] ) continue;
-        if ( fmt_map[i]->n > nsize ) nsize = fmt_map[i]->n;
+        if ( fmt_map[i]->n > max_ploidy ) max_ploidy = fmt_map[i]->n;
     }
 
-    if ( ma->ntmp_arr < nsamples*nsize*msize )
+    if ( ma->ntmp_arr < nsamples*max_ploidy*msize )
     {
-        ma->ntmp_arr = nsamples*nsize*msize;
+        ma->ntmp_arr = nsamples*max_ploidy*msize;
         ma->tmp_arr  = realloc(ma->tmp_arr, ma->ntmp_arr);
     }
     memset(ma->smpl_ploidy,0,nsamples*sizeof(int));
@@ -1155,7 +1157,7 @@ void merge_GT(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
         bcf_sr_t *reader = &files->readers[i];
         bcf_hdr_t *hdr = reader->header;
         bcf_fmt_t *fmt_ori = fmt_map[i];
-        int32_t *tmp  = (int32_t *) ma->tmp_arr + ismpl*nsize;
+        int32_t *tmp  = (int32_t *) ma->tmp_arr + ismpl*max_ploidy;
 
         int j, k;
         if ( !fmt_ori )
@@ -1163,8 +1165,8 @@ void merge_GT(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
             // missing values: assume maximum ploidy
             for (j=0; j<bcf_hdr_nsamples(hdr); j++)
             {
-                for (k=0; k<nsize; k++) { tmp[k] = 0; ma->smpl_ploidy[ismpl+j]++; }
-                tmp += nsize;
+                for (k=0; k<max_ploidy; k++) { tmp[k] = 0; ma->smpl_ploidy[ismpl+j]++; }
+                tmp += max_ploidy;
             }
             ismpl += bcf_hdr_nsamples(hdr);
             continue;
@@ -1184,8 +1186,8 @@ void merge_GT(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                         if ( bcf_gt_is_missing(p_ori[k]) ) tmp[k] = 0; /* missing allele */ \
                         else tmp[k] = p_ori[k]; \
                     } \
-                    for (; k<nsize; k++) tmp[k] = bcf_int32_vector_end; \
-                    tmp += nsize; \
+                    for (; k<max_ploidy; k++) tmp[k] = bcf_int32_vector_end; \
+                    tmp += max_ploidy; \
                     p_ori += fmt_ori->n; \
                 } \
                 ismpl += bcf_hdr_nsamples(hdr); \
@@ -1200,14 +1202,14 @@ void merge_GT(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                     ma->smpl_ploidy[ismpl+j]++; \
                     if ( bcf_gt_is_missing(p_ori[k]) ) tmp[k] = 0; /* missing allele */ \
                     else \
-                    { \
+                    { /*WTF??*/ \
                         int al = (p_ori[k]>>1) - 1; \
                         al = al<=0 ? al + 1 : ma->d[i][0].map[al] + 1; \
                         tmp[k] = (al << 1) | ((p_ori[k])&1); \
                     } \
                 } \
-                for (; k<nsize; k++) tmp[k] = bcf_int32_vector_end; \
-                tmp += nsize; \
+                for (; k<max_ploidy; k++) tmp[k] = bcf_int32_vector_end; \
+                tmp += max_ploidy; \
                 p_ori += fmt_ori->n; \
             } \
             ismpl += bcf_hdr_nsamples(hdr); \
@@ -1221,7 +1223,7 @@ void merge_GT(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
         }
         #undef BRANCH
     }
-    bcf_update_format_int32(out_hdr, out, "GT", (int32_t*)ma->tmp_arr, nsamples*nsize);
+    bcf_update_format_int32(out_hdr, out, "GT", (int32_t*)ma->tmp_arr, nsamples*max_ploidy);
 }
 
 void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
@@ -1510,6 +1512,7 @@ void merge_format(args_t *args, bcf1_t *out)
         ma->minf = out->d.m_info;
     }
 
+    //0 is GT field - already merged
     for (i=1; i<=max_ifmt; i++)
         merge_format_field(args, &ma->fmt_map[i*files->nreaders], out);
     out->d.indiv_dirty = 1;
