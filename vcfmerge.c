@@ -124,6 +124,17 @@ typedef struct
 }
 args_t;
 
+#ifdef DEBUG
+#define ASSERT(X)  assert(X)
+FILE* g_debug_fptr = 0;
+FILE* g_vcf_debug_fptr = 0;
+kstring_t g_debug_string = { 0, 0, 0 };
+#else
+#define ASSERT(X) ;
+#endif
+unsigned g_preprocess_vcfs = 1;
+const char* g_info2format_suffix = "_INFO";
+
 static void info_rules_merge_sum(bcf_hdr_t *hdr, bcf1_t *line, info_rule_t *rule)
 {
     if ( !rule->nvals ) return;
@@ -691,7 +702,7 @@ void merge_chrom2qual(args_t *args, bcf1_t *out)
 
         bcf_sr_t *reader = &files->readers[i];
         bcf1_t *line = reader->buffer[0];
-        bcf_hdr_t *hdr = reader->header;
+        bcf_hdr_t *hdr = reader->processed_header;
 
         // alleles
         int j;
@@ -780,7 +791,7 @@ void merge_filter(args_t *args, bcf1_t *out)
 
         bcf_sr_t *reader = &files->readers[i];
         bcf1_t *line = reader->buffer[0];
-        bcf_hdr_t *hdr = reader->header;
+        bcf_hdr_t *hdr = reader->processed_header;
         bcf_unpack(line, BCF_UN_ALL);
 
         int k;
@@ -1028,8 +1039,8 @@ void merge_info(args_t *args, bcf1_t *out)
         if ( !ma->has_line[i] ) continue;
         bcf_sr_t *reader = &files->readers[i];
         bcf1_t *line = reader->buffer[0];
-        bcf_hdr_t *hdr = reader->header;
-        for (j=0; j<line->n_info; j++)
+        bcf_hdr_t *hdr = reader->processed_header;
+        for (j=0; j<line->n_info; j++) 
         {
             bcf_info_t *inf = &line->d.info[j];
 
@@ -1155,7 +1166,7 @@ void merge_GT(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
     for (i=0; i<files->nreaders; i++)
     {
         bcf_sr_t *reader = &files->readers[i];
-        bcf_hdr_t *hdr = reader->header;
+        bcf_hdr_t *hdr = reader->processed_header;
         bcf_fmt_t *fmt_ori = fmt_map[i];
         int32_t *tmp  = (int32_t *) ma->tmp_arr + ismpl*max_ploidy;
 
@@ -1239,7 +1250,7 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
     {
         if ( !ma->has_line[i] ) continue;
         if ( !fmt_map[i] ) continue;
-        if ( !key ) key = files->readers[i].header->id[BCF_DT_ID][fmt_map[i]->id].key;
+        if ( !key ) key = files->readers[i].processed_header->id[BCF_DT_ID][fmt_map[i]->id].key;
         type = fmt_map[i]->type;
         if ( IS_VL_G(files->readers[i].header, fmt_map[i]->id) )
         {
@@ -1273,7 +1284,7 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
     for (i=0; i<files->nreaders; i++)
     {
         bcf_sr_t *reader = &files->readers[i];
-        bcf_hdr_t *hdr = reader->header;
+        bcf_hdr_t *hdr = reader->processed_header;
         bcf_fmt_t *fmt_ori = fmt_map[i];
         if ( fmt_ori )
         {
@@ -1464,8 +1475,8 @@ void merge_format(args_t *args, bcf1_t *out)
         if ( !ma->has_line[i] ) continue;
         bcf_sr_t *reader = &files->readers[i];
         bcf1_t *line = reader->buffer[0];
-        bcf_hdr_t *hdr = reader->header;
-        for (j=0; j<line->n_fmt; j++)
+        bcf_hdr_t *hdr = reader->processed_header;
+        for (j=0; j<line->n_fmt; j++) 
         {
             // Wat this tag already seen?
             bcf_fmt_t *fmt = &line->d.fmt[j];
@@ -1679,6 +1690,113 @@ void debug_maux(args_t *args, int pos, int var_type)
     fprintf(stderr,"\n");
 }
 
+//Allocates new memory
+char* modify_info_string(const char* orig)
+{
+    char* tmp = (char*)malloc(strlen(orig) + strlen(g_info2format_suffix)+1);
+    strcpy(tmp, orig);
+    strcat(tmp, g_info2format_suffix);
+    return tmp;
+}
+
+int get_element_size(int bcf_ht_type)
+{
+    switch(bcf_ht_type)
+    {
+        case BCF_HT_STR:
+        case BCF_HT_FLAG: 
+            return 1;
+            break;
+        case BCF_HT_INT:
+            return sizeof(int);
+            break;
+        case BCF_HT_REAL:
+            return sizeof(float);
+            break;
+        default:
+            fprintf(stderr,"Unknown BCF_HT_TYPE : %d\n",bcf_ht_type);
+    }
+    assert(0);
+    return -1;  //should never come here
+}
+
+void move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, bcf1_t* src, bcf1_t* dst)
+{
+    int i = 0;
+    int j = 0;
+    //Temporary space
+    args->maux->ntmp_arr = 10;
+    args->maux->tmp_arr = realloc(args->maux->tmp_arr,10*sizeof(int));
+    char* format_array = (char*)malloc(1024);  //Q:why 1024 A:why not? will be realloc-ed if necessary
+    //TODO - should really iterate over bcf_info_t
+    for(i=0;i<src_hdr->n[BCF_DT_ID];++i)        //iterate over ID key-value pairs
+    {
+        //is this an INFO field?
+        if(bcf_hdr_idinfo_exists(src_hdr, BCF_HL_INFO, i))
+        {
+            bcf_idpair_t* curr_pair = &(src_hdr->id[BCF_DT_ID][i]);
+            const char* info_string = curr_pair->key;
+            int type = bcf_hdr_id2type(src_hdr, BCF_HL_INFO, i);
+            int num_values_written = bcf_get_info_values(src_hdr, src, info_string,
+                    &(args->maux->tmp_arr), &(args->maux->ntmp_arr), type);
+            int element_size = get_element_size(type);
+            //No nasty error expected
+            ASSERT(num_values_written != -1 && num_values_written != -2);
+            //INFO key found - move to FORMAT
+            if(num_values_written > 0)
+            {
+                //for flag get_info_values does not write the actual value. why? who knows
+                //Format fields have no FLAG type, convert to INT and write
+                if(type == BCF_HT_FLAG) 
+                {
+                    args->maux->tmp_arr = realloc(args->maux->tmp_arr, num_values_written*sizeof(int));
+                    args->maux->ntmp_arr = num_values_written;
+                    int* flag_array = (int*)(args->maux->tmp_arr);
+                    for(j=0;j<num_values_written;++j)
+                        flag_array[j] = 1;
+                }
+                //Add _INFO suffix
+                char* processed_info_string = modify_info_string(info_string);
+                //INFO fields are common across samples, to move to FORMAT must increase the array
+                //size so that there is a value or list of values for every sample (identical info)
+                int nsamples = bcf_hdr_nsamples(src_hdr);
+                int bytes_per_sample = num_values_written*element_size;
+                format_array = (char*)realloc(format_array, nsamples*bytes_per_sample);
+                int idx = 0;
+                for(j=0;j<nsamples;++j)
+                {
+                    memcpy(format_array+idx, (char*)(args->maux->tmp_arr), bytes_per_sample);
+                    idx += bytes_per_sample;
+                }
+                //remove INFO field
+                int delete_info = bcf_update_info(dst_hdr, dst, info_string, 0, 0, type);
+                ASSERT(delete_info >= 0);
+                //format fields have no flag type
+                bcf_update_format(dst_hdr, dst, processed_info_string, format_array, num_values_written*nsamples, type == BCF_HT_FLAG ? BCF_HT_INT : type);
+#ifdef DEBUG
+                vcf_format(dst_hdr,dst,&g_debug_string);
+                /*fprintf(g_vcf_debug_fptr,"DEBUG:: %s",g_debug_string.s);*/
+                /*fflush(g_vcf_debug_fptr);*/
+                g_debug_string.l = 0;
+#endif
+            }
+        }
+    }
+}
+
+bcf1_t* preprocess_line(args_t* args, bcf_sr_t* reader)
+{
+    //Copy of source line
+    bcf1_t* new_line = bcf_dup(reader->buffer[0]);
+    //Translate to destination header
+    bcf_translate(reader->processed_header, reader->header, new_line);
+    //Move INFO fields to destination's FORMAT fields
+    /*move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, bcf1_t* src, bcf1_t* dst)*/
+    move_info_to_format(args, reader->header, reader->processed_header, reader->buffer[0], new_line);
+    bcf_unpack(new_line, BCF_UN_ALL);
+    return new_line;
+}
+
 // Determine which line should be merged from which reader: go through all
 // readers and all buffered lines, expand REF,ALT and try to match lines with
 // the same ALTs. A step towards output independent on input ordering of the
@@ -1840,6 +1958,8 @@ void merge_buffer(args_t *args)
                     SWAP(bcf1_t*, reader->buffer[0], reader->buffer[j]);
                     SWAP(maux1_t, maux->d[i][0], maux->d[i][j]);
                 }
+                if(g_preprocess_vcfs)
+                    reader->buffer[0] = preprocess_line(args, reader);
                 // mark as finished so that it's ignored next time
                 maux->d[i][0].skip |= SKIP_DONE;
                 maux->has_line[i] = 1;
@@ -1887,6 +2007,102 @@ void bcf_hdr_append_version(bcf_hdr_t *hdr, int argc, char **argv, const char *c
     bcf_hdr_sync(hdr);
 }
 
+typedef struct
+{
+    int type;
+    const char* key;
+} erase_hrec_struct;
+
+//Drop unnecessary fields
+//Move INFO fields to FORMAT
+void preprocess_header(bcf_hdr_t* src_hdr)
+{
+    int i = 0;
+    int j = 0;
+    bcf_hdr_t* hdr = src_hdr;
+
+    //Array to store hrecs which will be erased from hdr
+    erase_hrec_struct* erase_array = (erase_hrec_struct*)malloc(hdr->n[BCF_DT_ID]*sizeof(erase_hrec_struct));
+    int erase_idx = 0;
+    //Array to store hrecs which will be added at the end
+    bcf_hrec_t** add_array = (bcf_hrec_t**)malloc(hdr->n[BCF_DT_ID]*sizeof(bcf_hrec_t*));
+    int add_idx = 0;
+
+    //Drop un-necessary fields
+
+    //Move INFO fields to FORMAT
+    //TODO: convert flag to int
+    for(i=0;i<hdr->n[BCF_DT_ID];++i)        //iterate over ID key-value pairs
+    {
+        //is this an INFO field?
+        if(bcf_hdr_idinfo_exists(hdr, BCF_HL_INFO, i))
+        {
+            bcf_idpair_t* curr_pair = &(hdr->id[BCF_DT_ID][i]);
+            const char* info_string = curr_pair->key;
+            int type = bcf_hdr_id2type(hdr, BCF_HL_INFO, i);
+            //Mark for removal
+            ASSERT(erase_idx < hdr->n[BCF_DT_ID]);
+            erase_array[erase_idx].type = BCF_HL_INFO;
+            erase_array[erase_idx++].key = info_string;
+            //Create a copy of hrec as we will remove that hrec from the header and add new hrec
+            bcf_hrec_t* orig_hrec = bcf_hdr_id2hrec_fixed(hdr, BCF_DT_ID, BCF_HL_INFO, i);
+            ASSERT(orig_hrec);
+            bcf_hrec_t* tmp = bcf_hrec_dup(orig_hrec);
+            //change type to FORMAT
+            tmp->type = BCF_HL_FMT;
+            tmp->key = (char*)realloc(tmp->key, strlen("FORMAT")+1);        //for end NULL char
+            strcpy(tmp->key, "FORMAT");
+            //Find ID field in INFO hrec and change its value
+            int idx = bcf_hrec_find_key(tmp, "ID");
+            ASSERT(idx >= 0);
+            tmp->vals[idx] = modify_info_string(tmp->vals[idx]);
+            //FORMAT fields do not have FLAG type, convert to int if this field is of type FLAG
+            if(type == BCF_HT_FLAG)
+            {
+                //Number == 0 for all FLAG types in INFO, set to 1 for FORMAT field
+                idx = bcf_hrec_find_key(tmp, "Number");
+                if(idx <  0)    //No such field exists, add field first
+                {
+                    bcf_hrec_add_key(tmp,"Number",strlen("Number")); 
+                    idx = bcf_hrec_find_key(tmp, "Number");
+                }
+                ASSERT(idx >= 0);
+                bcf_hrec_set_val(tmp, idx, "1", 1, 0);
+                //Change type to Integer
+                idx = bcf_hrec_find_key(tmp, "Type");
+                if(idx <  0)    //No such field exists, add field first
+                {
+                    bcf_hrec_add_key(tmp,"Type",strlen("Type")); 
+                    idx = bcf_hrec_find_key(tmp, "Type");
+                }
+                ASSERT(idx >= 0);
+                bcf_hrec_set_val(tmp, idx, "Integer", strlen("Integer"), 0);
+            }
+            ASSERT(add_idx < hdr->n[BCF_DT_ID]);
+            //Store format field to add to new hdr
+            add_array[add_idx++] = tmp;
+        }
+    }
+    //Add hrecs
+    for(j=0;j<add_idx;++j)
+    {
+        bcf_hdr_add_hrec(hdr, add_array[j]);
+    }
+    free(add_array);
+    //Erase hrecs
+    for(j=0;j<erase_idx;++j)
+    {
+        bcf_hdr_remove(hdr, erase_array[j].type, erase_array[j].key);
+    }
+    free(erase_array);
+#ifdef DEBUG
+    int hdr_str_length = 0;
+    char* hdr_str = bcf_hdr_fmt_text(hdr, 0, &hdr_str_length);
+    fprintf(g_debug_fptr,"%s",hdr_str);
+    fflush(g_debug_fptr);
+#endif
+}
+
 void merge_vcf(args_t *args)
 {
     args->out_fh  = hts_open(args->output_fname, hts_bcf_wmode(args->output_type));
@@ -1903,7 +2119,18 @@ void merge_vcf(args_t *args)
         for (i=0; i<args->files->nreaders; i++)
         {
             char buf[10]; snprintf(buf,10,"%d",i+1);
-            bcf_hdr_merge(args->out_hdr, args->files->readers[i].header,buf,args->force_samples);
+            /*bcf_hdr_merge(args->out_hdr, args->files->readers[i].header,buf,args->force_samples);*/
+            bcf_hdr_t* hdr = args->files->readers[i].header;
+            if(g_preprocess_vcfs)       //create duplicate header for changes
+            {
+                args->files->readers[i].header->ntransl = 0;    //required for bcf_translate later
+                args->files->readers[i].processed_header = bcf_hdr_dup(args->files->readers[i].header);
+                preprocess_header(args->files->readers[i].processed_header);
+                hdr = args->files->readers[i].processed_header;
+            }
+            else                //else point to same header
+                args->files->readers[i].processed_header = args->files->readers[i].header;
+            bcf_hdr_merge(args->out_hdr, hdr, buf);
         }
         bcf_hdr_append_version(args->out_hdr, args->argc, args->argv, "bcftools_merge");
         bcf_hdr_sync(args->out_hdr);
@@ -1971,6 +2198,11 @@ int main_vcfmerge(int argc, char *argv[])
     args->output_type = FT_VCF;
     args->collapse = COLLAPSE_BOTH;
     int regions_is_file = 0;
+#ifdef DEBUG
+    g_debug_fptr = fopen("debug.txt","w");
+    g_vcf_debug_fptr = stdout;
+    ks_resize(&g_debug_string, 4096);   //4KB
+#endif
 
     static struct option loptions[] =
     {
@@ -2048,7 +2280,16 @@ int main_vcfmerge(int argc, char *argv[])
     }
     merge_vcf(args);
     bcf_sr_destroy(args->files);
+    if(g_preprocess_vcfs)       //destroy modified headers
+    {
+        int i;
+        for(i=0;i<args->files->nreaders;++i)
+            bcf_hdr_destroy(args->files->readers[i].processed_header);
+    }
     free(args);
+#ifdef DEBUG
+    fclose(g_debug_fptr);
+#endif
     return 0;
 }
 

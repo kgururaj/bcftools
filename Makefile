@@ -35,16 +35,22 @@ HTSLIB = $(HTSDIR)/libhts.a
 BGZIP  = $(HTSDIR)/bgzip
 TABIX  = $(HTSDIR)/tabix
 
-CC       = gcc
-CFLAGS   = -g -Wall -Wc++-compat -O2
-DFLAGS   =
+DEBUG=1
+CC=			gcc
+ifdef DEBUG
+    CFLAGS = -g -g3 -DDEBUG
+else
+    CFLAGS = -O3
+endif
+CFLAGS+=	-Wall -Wc++-compat
+DFLAGS=
 OBJS     = main.o vcfindex.o tabix.o \
            vcfstats.o vcfisec.o vcfmerge.o vcfquery.o vcffilter.o filter.o vcfsom.o \
            vcfnorm.o vcfgtcheck.o vcfview.o vcfannotate.o vcfroh.o vcfconcat.o \
            vcfcall.o mcall.o vcmp.o gvcf.o reheader.o convert.o vcfconvert.o tsv2vcf.o \
            vcfcnv.o HMM.o vcfplugin.o consensus.o ploidy.o version.o \
            ccall.o em.o prob1.o kmin.o # the original samtools calling
-INCLUDES = -I. -I$(HTSDIR)
+INCLUDES=	-I. -I$(HTSDIR)
 
 # The polysomy command is not compiled by default because it brings dependency
 # on libgsl. The command can be compiled wth `make USE_GPL=1`. See the INSTALL
@@ -156,7 +162,7 @@ test/test-rbuf: test/test-rbuf.o
 	$(CC) $(CFLAGS) -o $@ -lm -ldl $<
 
 bcftools: $(HTSLIB) $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(HTSLIB) -lpthread -lz -lm -ldl $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) -Wl,-Bstatic -L$(HTSDIR) -lhts -Wl,-Bdynamic -lpthread -lz -lm -ldl $(LDLIBS)
 
 doc/bcftools.1: doc/bcftools.txt
 	cd doc && a2x -adate="$(DOC_DATE)" -aversion=$(DOC_VERSION) --doctype manpage --format manpage bcftools.txt
