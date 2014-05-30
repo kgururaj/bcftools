@@ -1729,57 +1729,60 @@ void move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, b
     args->maux->tmp_arr = realloc(args->maux->tmp_arr,10*sizeof(int));
     char* format_array = (char*)malloc(1024);  //Q:why 1024 A:why not? will be realloc-ed if necessary
     //TODO - should really iterate over bcf_info_t
-    for(i=0;i<src_hdr->n[BCF_DT_ID];++i)        //iterate over ID key-value pairs
-    {
+    /*for(i=0;i<src_hdr->n[BCF_DT_ID];++i)        //iterate over ID key-value pairs*/
         //is this an INFO field?
-        if(bcf_hdr_idinfo_exists(src_hdr, BCF_HL_INFO, i))
+    /*if(bcf_hdr_idinfo_exists(src_hdr, BCF_HL_INFO, i))*/
+    /*{*/
+    for(i=0;i<src->n_info;++i)
+    {
+        int dict_idx = src->d.info[i].key;
+        bcf_idpair_t* curr_pair = &(src_hdr->id[BCF_DT_ID][dict_idx]);
+        const char* info_string = curr_pair->key;
+        int type = bcf_hdr_id2type(src_hdr, BCF_HL_INFO, dict_idx);
+        int num_values_written = bcf_get_info_values(src_hdr, src, info_string,
+                &(args->maux->tmp_arr), &(args->maux->ntmp_arr), type);
+        //TODO
+        int element_size = get_element_size(type);
+        //No nasty error expected
+        ASSERT(num_values_written != -1 && num_values_written != -2);
+        //INFO key found - move to FORMAT
+        if(num_values_written > 0)
         {
-            bcf_idpair_t* curr_pair = &(src_hdr->id[BCF_DT_ID][i]);
-            const char* info_string = curr_pair->key;
-            int type = bcf_hdr_id2type(src_hdr, BCF_HL_INFO, i);
-            int num_values_written = bcf_get_info_values(src_hdr, src, info_string,
-                    &(args->maux->tmp_arr), &(args->maux->ntmp_arr), type);
-            int element_size = get_element_size(type);
-            //No nasty error expected
-            ASSERT(num_values_written != -1 && num_values_written != -2);
-            //INFO key found - move to FORMAT
-            if(num_values_written > 0)
+            //for flag get_info_values does not write the actual value. why? who knows
+            //Format fields have no FLAG type, convert to INT and write
+            if(type == BCF_HT_FLAG) 
             {
-                //for flag get_info_values does not write the actual value. why? who knows
-                //Format fields have no FLAG type, convert to INT and write
-                if(type == BCF_HT_FLAG) 
-                {
-                    args->maux->tmp_arr = realloc(args->maux->tmp_arr, num_values_written*sizeof(int));
-                    args->maux->ntmp_arr = num_values_written;
-                    int* flag_array = (int*)(args->maux->tmp_arr);
-                    for(j=0;j<num_values_written;++j)
-                        flag_array[j] = 1;
-                }
-                //Add _INFO suffix
-                char* processed_info_string = modify_info_string(info_string);
-                //INFO fields are common across samples, to move to FORMAT must increase the array
-                //size so that there is a value or list of values for every sample (identical info)
-                int nsamples = bcf_hdr_nsamples(src_hdr);
-                int bytes_per_sample = num_values_written*element_size;
-                format_array = (char*)realloc(format_array, nsamples*bytes_per_sample);
-                int idx = 0;
-                for(j=0;j<nsamples;++j)
-                {
-                    memcpy(format_array+idx, (char*)(args->maux->tmp_arr), bytes_per_sample);
-                    idx += bytes_per_sample;
-                }
-                //remove INFO field
-                int delete_info = bcf_update_info(dst_hdr, dst, info_string, 0, 0, type);
-                ASSERT(delete_info >= 0);
-                //format fields have no flag type
-                bcf_update_format(dst_hdr, dst, processed_info_string, format_array, num_values_written*nsamples, type == BCF_HT_FLAG ? BCF_HT_INT : type);
-#ifdef DEBUG
-                vcf_format(dst_hdr,dst,&g_debug_string);
-                /*fprintf(g_vcf_debug_fptr,"DEBUG:: %s",g_debug_string.s);*/
-                /*fflush(g_vcf_debug_fptr);*/
-                g_debug_string.l = 0;
-#endif
+                args->maux->tmp_arr = realloc(args->maux->tmp_arr, num_values_written*sizeof(int));
+                args->maux->ntmp_arr = num_values_written;
+                int* flag_array = (int*)(args->maux->tmp_arr);
+                for(j=0;j<num_values_written;++j)
+                    flag_array[j] = 1;
+                element_size = sizeof(int);       //using int now
             }
+            //Add _INFO suffix
+            char* processed_info_string = modify_info_string(info_string);
+            //INFO fields are common across samples, to move to FORMAT must increase the array
+            //size so that there is a value or list of values for every sample (identical info)
+            int nsamples = bcf_hdr_nsamples(src_hdr);
+            int bytes_per_sample = num_values_written*element_size;
+            format_array = (char*)realloc(format_array, nsamples*bytes_per_sample);
+            int idx = 0;
+            for(j=0;j<nsamples;++j)
+            {
+                memcpy(format_array+idx, (char*)(args->maux->tmp_arr), bytes_per_sample);
+                idx += bytes_per_sample;
+            }
+            //remove INFO field
+            int delete_info = bcf_update_info(dst_hdr, dst, info_string, 0, 0, type);
+            ASSERT(delete_info >= 0);
+            //format fields have no flag type
+            bcf_update_format(dst_hdr, dst, processed_info_string, format_array, num_values_written*nsamples, type == BCF_HT_FLAG ? BCF_HT_INT : type);
+#ifdef DEBUG
+            vcf_format(dst_hdr,dst,&g_debug_string);
+            fprintf(g_vcf_debug_fptr,"DEBUG:: %s",g_debug_string.s);
+            fflush(g_vcf_debug_fptr);
+            g_debug_string.l = 0;
+#endif
         }
     }
 }
@@ -1788,6 +1791,7 @@ bcf1_t* preprocess_line(args_t* args, bcf_sr_t* reader)
 {
     //Copy of source line
     bcf1_t* new_line = bcf_dup(reader->buffer[0]);
+    bcf_unpack(reader->buffer[0], BCF_UN_ALL);
     //Translate to destination header
     bcf_translate(reader->processed_header, reader->header, new_line);
     //Move INFO fields to destination's FORMAT fields
