@@ -35,7 +35,7 @@ HTSLIB = $(HTSDIR)/libhts.a
 BGZIP  = $(HTSDIR)/bgzip
 TABIX  = $(HTSDIR)/tabix
 
-DEBUG=1
+#DEBUG=1
 CC=			gcc
 ifdef DEBUG
     CFLAGS = -g -g3 -DDEBUG

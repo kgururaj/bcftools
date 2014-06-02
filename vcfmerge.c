@@ -132,7 +132,7 @@ kstring_t g_debug_string = { 0, 0, 0 };
 #else
 #define ASSERT(X) ;
 #endif
-unsigned g_preprocess_vcfs = 1;
+unsigned g_preprocess_vcfs = 0;
 const char* g_info2format_suffix = "_INFO";
 
 static void info_rules_merge_sum(bcf_hdr_t *hdr, bcf1_t *line, info_rule_t *rule)
@@ -1258,7 +1258,7 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
             nsize = out->n_allele*(out->n_allele + 1)/2;
             break;
         }
-        if ( IS_VL_A(files->readers[i].header, fmt_map[i]->id) )
+        if ( IS_VL_A(files->readers[i].processed_header, fmt_map[i]->id) )
         {
             length = BCF_VL_A;
             nsize = out->n_allele - 1;
@@ -1798,6 +1798,8 @@ bcf1_t* preprocess_line(args_t* args, bcf_sr_t* reader)
     /*move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, bcf1_t* src, bcf1_t* dst)*/
     move_info_to_format(args, reader->header, reader->processed_header, reader->buffer[0], new_line);
     bcf_unpack(new_line, BCF_UN_ALL);
+    //Destroy original bcf1_t object
+    bcf_destroy(reader->buffer[0]);
     return new_line;
 }
 
