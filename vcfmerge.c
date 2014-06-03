@@ -132,8 +132,15 @@ kstring_t g_debug_string = { 0, 0, 0 };
 #else
 #define ASSERT(X) ;
 #endif
-unsigned g_preprocess_vcfs = 0;
+unsigned g_preprocess_vcfs = 1;
 const char* g_info2format_suffix = "_INFO";
+
+#define REALLOC_IF_NEEDED(ptr, curr_num_elements, new_num_elements, type)       \
+    if((new_num_elements) > (curr_num_elements))                                \
+    {                                                                           \
+        (curr_num_elements) = (new_num_elements);                               \
+        (ptr) = (type*)realloc((ptr), (new_num_elements)*sizeof(type));         \
+    }
 
 static void info_rules_merge_sum(bcf_hdr_t *hdr, bcf1_t *line, info_rule_t *rule)
 {
@@ -1691,12 +1698,19 @@ void debug_maux(args_t *args, int pos, int var_type)
 }
 
 //Allocates new memory
-char* modify_info_string(const char* orig)
+char* modify_info_string(const char* orig, char* dst, int* dst_allocated)
 {
-    char* tmp = (char*)malloc(strlen(orig) + strlen(g_info2format_suffix)+1);
-    strcpy(tmp, orig);
-    strcat(tmp, g_info2format_suffix);
-    return tmp;
+    int newlength = strlen(orig) + strlen(g_info2format_suffix)+1;
+    int do_copy = 1;
+    if(orig == dst)
+        do_copy = 0;
+    int tmp = 0;
+    int* target_ptr = (dst_allocated == 0 ? &tmp : dst_allocated);
+    REALLOC_IF_NEEDED(dst, *target_ptr, newlength, char);
+    if(do_copy)
+        strcpy(dst, orig);
+    strcat(dst, g_info2format_suffix);
+    return dst;
 }
 
 int get_element_size(int bcf_ht_type)
@@ -1728,11 +1742,9 @@ void move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, b
     args->maux->ntmp_arr = 10;
     args->maux->tmp_arr = realloc(args->maux->tmp_arr,10*sizeof(int));
     char* format_array = (char*)malloc(1024);  //Q:why 1024 A:why not? will be realloc-ed if necessary
-    //TODO - should really iterate over bcf_info_t
-    /*for(i=0;i<src_hdr->n[BCF_DT_ID];++i)        //iterate over ID key-value pairs*/
-        //is this an INFO field?
-    /*if(bcf_hdr_idinfo_exists(src_hdr, BCF_HL_INFO, i))*/
-    /*{*/
+    int format_array_allocated = 1024;
+    char* processed_info_string = (char*)malloc(1024);  //Q:why 1024 A:why not? will be realloc-ed if necessary
+    int processed_info_string_allocated = 1024;
     for(i=0;i<src->n_info;++i)
     {
         int dict_idx = src->d.info[i].key;
@@ -1752,20 +1764,19 @@ void move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, b
             //Format fields have no FLAG type, convert to INT and write
             if(type == BCF_HT_FLAG) 
             {
-                args->maux->tmp_arr = realloc(args->maux->tmp_arr, num_values_written*sizeof(int));
-                args->maux->ntmp_arr = num_values_written;
+                REALLOC_IF_NEEDED(args->maux->tmp_arr, args->maux->ntmp_arr, num_values_written, int);
                 int* flag_array = (int*)(args->maux->tmp_arr);
                 for(j=0;j<num_values_written;++j)
                     flag_array[j] = 1;
                 element_size = sizeof(int);       //using int now
             }
             //Add _INFO suffix
-            char* processed_info_string = modify_info_string(info_string);
+            processed_info_string = modify_info_string(info_string, processed_info_string, &processed_info_string_allocated);
             //INFO fields are common across samples, to move to FORMAT must increase the array
             //size so that there is a value or list of values for every sample (identical info)
             int nsamples = bcf_hdr_nsamples(src_hdr);
             int bytes_per_sample = num_values_written*element_size;
-            format_array = (char*)realloc(format_array, nsamples*bytes_per_sample);
+            REALLOC_IF_NEEDED(format_array, format_array_allocated, nsamples*bytes_per_sample, char);
             int idx = 0;
             for(j=0;j<nsamples;++j)
             {
@@ -1785,6 +1796,8 @@ void move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, b
 #endif
         }
     }
+    free(format_array);
+    free(processed_info_string);
 }
 
 bcf1_t* preprocess_line(args_t* args, bcf_sr_t* reader)
@@ -2061,7 +2074,7 @@ void preprocess_header(bcf_hdr_t* src_hdr)
             //Find ID field in INFO hrec and change its value
             int idx = bcf_hrec_find_key(tmp, "ID");
             ASSERT(idx >= 0);
-            tmp->vals[idx] = modify_info_string(tmp->vals[idx]);
+            tmp->vals[idx] = modify_info_string(tmp->vals[idx], tmp->vals[idx], 0);
             //FORMAT fields do not have FLAG type, convert to int if this field is of type FLAG
             if(type == BCF_HT_FLAG)
             {
@@ -2106,6 +2119,7 @@ void preprocess_header(bcf_hdr_t* src_hdr)
     char* hdr_str = bcf_hdr_fmt_text(hdr, 0, &hdr_str_length);
     fprintf(g_debug_fptr,"%s",hdr_str);
     fflush(g_debug_fptr);
+    free(hdr_str);
 #endif
 }
 
