@@ -124,6 +124,10 @@ typedef struct
 }
 args_t;
 
+#ifdef PROFILE
+#include "gperftools/profiler.h"
+#endif
+
 #ifdef DEBUG
 #define ASSERT(X)  assert(X)
 FILE* g_debug_fptr = 0;
@@ -134,6 +138,44 @@ kstring_t g_debug_string = { 0, 0, 0 };
 #endif
 unsigned g_preprocess_vcfs = 1;
 const char* g_info2format_suffix = "_INFO";
+
+//Merge configuration
+enum MergeActionEnum
+{
+  MERGE_DEFAULT=0,
+  MERGE_INFO,
+  MERGE_FORMAT,
+  MERGE_KEEP,
+  MERGE_DROP,
+  MERGE_MOVE_TO_FORMAT,
+  MERGE_MEAN,
+  MERGE_SUM,
+  MERGE_MIN,
+  MERGE_MAX
+};
+#define do_detach(action_type) ((action_type) == MERGE_DROP || (action_type) == MERGE_MOVE_TO_FORMAT)
+typedef struct
+{
+  int default_action;   //one of the values in MergeActionEnum
+  strdict_t* info_field2action;   //map/dict from info field name to action
+  strdict_t* format_field2action;   //map/dict from info field name to action
+  int** file2id2action;        //2D array, 1 array for each reader, maps id in BCF_DT_ID dictionary to action
+  int num_files;
+}merge_config;
+strdict_t*  g_merge_config_token_2_idx = 0;
+merge_config g_merge_config = { 0, 0, 0, 0, 0 };
+
+int get_merge_action(const char* key_string, int is_info, int is_format)
+{
+    khiter_t kitr = is_info ? kh_get(strdict, g_merge_config.info_field2action, key_string)
+        : kh_get(strdict, g_merge_config.format_field2action, key_string);
+    int action_type =
+        ((is_info && kitr == kh_end(g_merge_config.info_field2action)) 
+            || (is_format &&  kitr == kh_end(g_merge_config.format_field2action)))
+        ? g_merge_config.default_action //if no entry found, do default action
+        : is_info ? kh_val(g_merge_config.info_field2action, kitr) : kh_val(g_merge_config.format_field2action, kitr);
+    return action_type;
+}
 
 #define REALLOC_IF_NEEDED(ptr, curr_num_elements, new_num_elements, type)       \
     if((new_num_elements) > (curr_num_elements))                                \
@@ -1734,7 +1776,7 @@ int get_element_size(int bcf_ht_type)
     return -1;  //should never come here
 }
 
-void move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, bcf1_t* src, bcf1_t* dst)
+void move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, bcf1_t* src, bcf1_t* dst, int file_idx)
 {
     int i = 0;
     int j = 0;
@@ -1745,15 +1787,18 @@ void move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, b
     int format_array_allocated = 1024;
     char* processed_info_string = (char*)malloc(1024);  //Q:why 1024 A:why not? will be realloc-ed if necessary
     int processed_info_string_allocated = 1024;
+    //Array to quickly lookup actions from id
+    int* id2action = g_merge_config.file2id2action[file_idx];
     for(i=0;i<src->n_info;++i)
     {
         int dict_idx = src->d.info[i].key;
+        if(id2action[dict_idx] != MERGE_MOVE_TO_FORMAT)
+            continue;
         bcf_idpair_t* curr_pair = &(src_hdr->id[BCF_DT_ID][dict_idx]);
         const char* info_string = curr_pair->key;
         int type = bcf_hdr_id2type(src_hdr, BCF_HL_INFO, dict_idx);
         int num_values_written = bcf_get_info_values(src_hdr, src, info_string,
                 &(args->maux->tmp_arr), &(args->maux->ntmp_arr), type);
-        //TODO
         int element_size = get_element_size(type);
         //No nasty error expected
         ASSERT(num_values_written != -1 && num_values_written != -2);
@@ -1800,16 +1845,17 @@ void move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, b
     free(processed_info_string);
 }
 
-bcf1_t* preprocess_line(args_t* args, bcf_sr_t* reader)
+bcf1_t* preprocess_line(args_t* args, bcf_sr_t* reader, int file_idx)
 {
     //Copy of source line
     bcf1_t* new_line = bcf_dup(reader->buffer[0]);
     bcf_unpack(reader->buffer[0], BCF_UN_ALL);
     //Translate to destination header
+    //Deleted fields will be dropped here
     bcf_translate(reader->processed_header, reader->header, new_line);
     //Move INFO fields to destination's FORMAT fields
     /*move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, bcf1_t* src, bcf1_t* dst)*/
-    move_info_to_format(args, reader->header, reader->processed_header, reader->buffer[0], new_line);
+    move_info_to_format(args, reader->header, reader->processed_header, reader->buffer[0], new_line, file_idx);
     bcf_unpack(new_line, BCF_UN_ALL);
     //Destroy original bcf1_t object
     bcf_destroy(reader->buffer[0]);
@@ -1978,7 +2024,7 @@ void merge_buffer(args_t *args)
                     SWAP(maux1_t, maux->d[i][0], maux->d[i][j]);
                 }
                 if(g_preprocess_vcfs)
-                    reader->buffer[0] = preprocess_line(args, reader);
+                    reader->buffer[0] = preprocess_line(args, reader, i);
                 // mark as finished so that it's ignored next time
                 maux->d[i][0].skip |= SKIP_DONE;
                 maux->has_line[i] = 1;
@@ -2034,7 +2080,7 @@ typedef struct
 
 //Drop unnecessary fields
 //Move INFO fields to FORMAT
-void preprocess_header(bcf_hdr_t* src_hdr)
+void preprocess_header(bcf_hdr_t* src_hdr, int file_idx)
 {
     int i = 0;
     int j = 0;
@@ -2047,59 +2093,73 @@ void preprocess_header(bcf_hdr_t* src_hdr)
     bcf_hrec_t** add_array = (bcf_hrec_t**)malloc(hdr->n[BCF_DT_ID]*sizeof(bcf_hrec_t*));
     int add_idx = 0;
 
-    //Drop un-necessary fields
-
+    //Used in preprocess_line to quickly lookup action from id (integer id)
+    ASSERT(file_idx < g_merge_config.num_files);
+    g_merge_config.file2id2action[file_idx] = (int*)malloc(hdr->n[BCF_DT_ID]*sizeof(int));
+    //Drop fields which need to be dropped
     //Move INFO fields to FORMAT
-    //TODO: convert flag to int
     for(i=0;i<hdr->n[BCF_DT_ID];++i)        //iterate over ID key-value pairs
     {
-        //is this an INFO field?
-        if(bcf_hdr_idinfo_exists(hdr, BCF_HL_INFO, i))
+        //is this an INFO or FORMAT field?
+        int is_info = bcf_hdr_idinfo_exists(hdr, BCF_HL_INFO, i);
+        int is_format = bcf_hdr_idinfo_exists(hdr, BCF_HL_FMT, i);
+        g_merge_config.file2id2action[file_idx][i] = g_merge_config.default_action;
+        if(is_info || is_format)
         {
             bcf_idpair_t* curr_pair = &(hdr->id[BCF_DT_ID][i]);
-            const char* info_string = curr_pair->key;
-            int type = bcf_hdr_id2type(hdr, BCF_HL_INFO, i);
+            const char* key_string = curr_pair->key;
+            int action_type = get_merge_action(key_string, is_info, is_format);
+            //Used in preprocess_line to quickly lookup action from id (integer id)
+            g_merge_config.file2id2action[file_idx][i] = action_type;
+
+            if(!do_detach(action_type)) //either keep,min,max etc, but do not detach (drop or move)
+                continue;
             //Mark for removal
             ASSERT(erase_idx < hdr->n[BCF_DT_ID]);
-            erase_array[erase_idx].type = BCF_HL_INFO;
-            erase_array[erase_idx++].key = info_string;
-            //Create a copy of hrec as we will remove that hrec from the header and add new hrec
-            bcf_hrec_t* orig_hrec = bcf_hdr_id2hrec_fixed(hdr, BCF_DT_ID, BCF_HL_INFO, i);
-            ASSERT(orig_hrec);
-            bcf_hrec_t* tmp = bcf_hrec_dup(orig_hrec);
-            //change type to FORMAT
-            tmp->type = BCF_HL_FMT;
-            tmp->key = (char*)realloc(tmp->key, strlen("FORMAT")+1);        //for end NULL char
-            strcpy(tmp->key, "FORMAT");
-            //Find ID field in INFO hrec and change its value
-            int idx = bcf_hrec_find_key(tmp, "ID");
-            ASSERT(idx >= 0);
-            tmp->vals[idx] = modify_info_string(tmp->vals[idx], tmp->vals[idx], 0);
-            //FORMAT fields do not have FLAG type, convert to int if this field is of type FLAG
-            if(type == BCF_HT_FLAG)
+            int type = is_info ? bcf_hdr_id2type(hdr, BCF_HL_INFO, i) : bcf_hdr_id2type(hdr, BCF_HL_FMT, i);
+            erase_array[erase_idx].type = is_info ? BCF_HL_INFO : BCF_HL_FMT;
+            erase_array[erase_idx++].key = key_string;
+            //If move to format, add to FORMAT
+            if(is_info && action_type == MERGE_MOVE_TO_FORMAT)
             {
-                //Number == 0 for all FLAG types in INFO, set to 1 for FORMAT field
-                idx = bcf_hrec_find_key(tmp, "Number");
-                if(idx <  0)    //No such field exists, add field first
+                //Create a copy of hrec as we will remove that hrec from the header and add new hrec
+                bcf_hrec_t* orig_hrec = bcf_hdr_id2hrec_fixed(hdr, BCF_DT_ID, BCF_HL_INFO, i);
+                ASSERT(orig_hrec);
+                bcf_hrec_t* tmp = bcf_hrec_dup(orig_hrec);
+                //change type to FORMAT
+                tmp->type = BCF_HL_FMT;
+                tmp->key = (char*)realloc(tmp->key, strlen("FORMAT")+1);        //for end NULL char
+                strcpy(tmp->key, "FORMAT");
+                //Find ID field in INFO hrec and change its value
+                int idx = bcf_hrec_find_key(tmp, "ID");
+                ASSERT(idx >= 0);
+                tmp->vals[idx] = modify_info_string(tmp->vals[idx], tmp->vals[idx], 0);
+                //FORMAT fields do not have FLAG type, convert to int if this field is of type FLAG
+                if(type == BCF_HT_FLAG)
                 {
-                    bcf_hrec_add_key(tmp,"Number",strlen("Number")); 
+                    //Number == 0 for all FLAG types in INFO, set to 1 for FORMAT field
                     idx = bcf_hrec_find_key(tmp, "Number");
-                }
-                ASSERT(idx >= 0);
-                bcf_hrec_set_val(tmp, idx, "1", 1, 0);
-                //Change type to Integer
-                idx = bcf_hrec_find_key(tmp, "Type");
-                if(idx <  0)    //No such field exists, add field first
-                {
-                    bcf_hrec_add_key(tmp,"Type",strlen("Type")); 
+                    if(idx <  0)    //No such field exists, add field first
+                    {
+                        bcf_hrec_add_key(tmp,"Number",strlen("Number")); 
+                        idx = bcf_hrec_find_key(tmp, "Number");
+                    }
+                    ASSERT(idx >= 0);
+                    bcf_hrec_set_val(tmp, idx, "1", 1, 0);
+                    //Change type to Integer
                     idx = bcf_hrec_find_key(tmp, "Type");
+                    if(idx <  0)    //No such field exists, add field first
+                    {
+                        bcf_hrec_add_key(tmp,"Type",strlen("Type")); 
+                        idx = bcf_hrec_find_key(tmp, "Type");
+                    }
+                    ASSERT(idx >= 0);
+                    bcf_hrec_set_val(tmp, idx, "Integer", strlen("Integer"), 0);
                 }
-                ASSERT(idx >= 0);
-                bcf_hrec_set_val(tmp, idx, "Integer", strlen("Integer"), 0);
+                ASSERT(add_idx < hdr->n[BCF_DT_ID]);
+                //Store format field to add to new hdr
+                add_array[add_idx++] = tmp;
             }
-            ASSERT(add_idx < hdr->n[BCF_DT_ID]);
-            //Store format field to add to new hdr
-            add_array[add_idx++] = tmp;
         }
     }
     //Add hrecs
@@ -2136,6 +2196,11 @@ void merge_vcf(args_t *args)
     else
     {
         int i;
+        if(g_preprocess_vcfs)
+        {
+            g_merge_config.file2id2action = (int**)malloc(args->files->nreaders*sizeof(int*));
+            g_merge_config.num_files = args->files->nreaders;
+        }
         for (i=0; i<args->files->nreaders; i++)
         {
             char buf[10]; snprintf(buf,10,"%d",i+1);
@@ -2145,7 +2210,7 @@ void merge_vcf(args_t *args)
             {
                 args->files->readers[i].header->ntransl = 0;    //required for bcf_translate later
                 args->files->readers[i].processed_header = bcf_hdr_dup(args->files->readers[i].header);
-                preprocess_header(args->files->readers[i].processed_header);
+                preprocess_header(args->files->readers[i].processed_header, i);
                 hdr = args->files->readers[i].processed_header;
             }
             else                //else point to same header
@@ -2171,10 +2236,16 @@ void merge_vcf(args_t *args)
     args->out_line = bcf_init1();
     args->tmph = kh_init(strdict);
     int ret;
+#ifdef PROFILE
+    ProfilerStart("gprofile.log");
+#endif
     while ( (ret=bcf_sr_next_line(args->files)) )
     {
         merge_buffer(args);
     }
+#ifdef PROFILE
+    ProfilerStop();
+#endif
     info_rules_destroy(args);
     maux_destroy(args->maux);
     bcf_hdr_destroy(args->out_hdr);
@@ -2183,6 +2254,135 @@ void merge_vcf(args_t *args)
     kh_destroy(strdict, args->tmph);
     if ( args->tmps.m ) free(args->tmps.s);
     if ( args->vcmp ) vcmp_destroy(args->vcmp);
+}
+
+void parse_merge_config(char* filename)
+{
+    FILE* fptr = fopen(filename,"r");
+    if(fptr == 0)
+    {
+        fprintf(stderr,"Unable to open merge config file %s -- exiting\n",filename);
+        exit(-1);
+    }
+    int ret = 0;
+    khiter_t kitr;
+    //Initialize tokens (char*) to idx - so that in future we use int instead of char*
+    g_merge_config_token_2_idx = kh_init(strdict);
+    kh_clear(strdict, g_merge_config_token_2_idx);
+    kitr = kh_put(strdict, g_merge_config_token_2_idx, "DEFAULT", &ret);
+    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_DEFAULT;
+    kitr = kh_put(strdict, g_merge_config_token_2_idx, "INFO", &ret);
+    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_INFO;
+    kitr = kh_put(strdict, g_merge_config_token_2_idx, "FORMAT", &ret);
+    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_FORMAT;
+    kitr = kh_put(strdict, g_merge_config_token_2_idx, "KEEP", &ret);
+    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_KEEP;
+    kitr = kh_put(strdict, g_merge_config_token_2_idx, "DROP", &ret);
+    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_DROP;
+    kitr = kh_put(strdict, g_merge_config_token_2_idx, "MOVE_TO_FORMAT", &ret);
+    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_MOVE_TO_FORMAT;
+    kitr = kh_put(strdict, g_merge_config_token_2_idx, "MEAN", &ret);
+    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_MEAN;
+    kitr = kh_put(strdict, g_merge_config_token_2_idx, "SUM", &ret);
+    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_SUM;
+    kitr = kh_put(strdict, g_merge_config_token_2_idx, "MIN", &ret);
+    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_MIN;
+    kitr = kh_put(strdict, g_merge_config_token_2_idx, "MAX", &ret);
+    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_MAX;
+
+    //Initialize merge_config structure
+    g_merge_config.default_action = MERGE_KEEP;
+    g_merge_config.info_field2action = kh_init(strdict);
+    kh_clear(strdict, g_merge_config.info_field2action);
+    g_merge_config.format_field2action = kh_init(strdict);
+    kh_clear(strdict, g_merge_config.format_field2action);
+
+
+    char* line = 0;
+    size_t linesize = 0;
+    size_t length = 0;
+    kstring_t string = { 0, 0, 0 };
+    int* token_offsets = 0;
+    int num_tokens = 0;
+    int i = 0;
+    while(!feof(fptr))
+    {
+        length = getline(&line, &linesize, fptr);
+        if(length == 0)
+            continue;
+        string.s = line;
+        string.l = length;
+        string.m = linesize;
+        token_offsets = ksplit(&string, '\t', &num_tokens);
+        for(i=0;i<num_tokens;++i)
+        {
+            char* ptr = line + token_offsets[i];
+            kitr = kh_get(strdict, g_merge_config_token_2_idx, ptr);
+            if( kitr == kh_end(g_merge_config_token_2_idx) )
+            {
+                fprintf(stderr,"Unknown token %s in merge config file\n", ptr);
+                exit(-1);
+            }
+            int type_idx = kh_val(g_merge_config_token_2_idx, kitr);
+            switch(type_idx)
+            {
+                case MERGE_DEFAULT:
+                    assert(num_tokens > i+1 && "DEFAULT token needs an argument : KEEP|DROP");
+                    ++i;
+                    ptr = line + token_offsets[i];
+                    kitr = kh_get(strdict, g_merge_config_token_2_idx, ptr);
+                    assert(kitr != kh_end(g_merge_config_token_2_idx) && "Argument to DEFAULT must be KEEP|DROP");
+                    g_merge_config.default_action = kh_val(g_merge_config_token_2_idx, kitr);
+                    break;
+                case MERGE_INFO:
+                case MERGE_FORMAT:
+                    assert(num_tokens > i+2 && "INFO/FORMAT token needs 2 arguments : FIELD_NAME KEEP|DROP");
+                    char* field = line + token_offsets[i+1];
+                    ptr = line + token_offsets[i+2];
+                    i += 2;
+                    kitr = kh_get(strdict, g_merge_config_token_2_idx, ptr);
+                    assert(kitr != kh_end(g_merge_config_token_2_idx) && "Action to INFO/FORMAT must be KEEP|DROP");
+                    int action_type = kh_val(g_merge_config_token_2_idx, kitr);
+                    assert((action_type == MERGE_KEEP || action_type == MERGE_DROP || action_type == MERGE_MOVE_TO_FORMAT)
+                            && "Action to INFO/FORMAT must be KEEP|DROP|MOVE_TO_FORMAT");
+                    if(type_idx == MERGE_INFO)
+                    {
+                        kh_put(strdict, g_merge_config.info_field2action, field, &ret);
+                        kitr = kh_get(strdict, g_merge_config.info_field2action, field);
+                        assert(kitr != kh_end(g_merge_config.info_field2action));
+                        kh_val(g_merge_config.info_field2action, kitr) = action_type;
+                    }
+                    else
+                    {
+                        kh_put(strdict, g_merge_config.format_field2action, field, &ret);
+                        kitr = kh_get(strdict, g_merge_config.format_field2action, field);
+                        assert(kitr != kh_end(g_merge_config.format_field2action));
+                        kh_val(g_merge_config.format_field2action, kitr) = action_type;
+                    }
+                    break;
+            }
+        }
+        if(num_tokens > 0)
+            free(token_offsets);
+    }
+    if(line != 0)
+        free(line);
+    fclose(fptr);
+}
+
+void destroy_merge_config()
+{
+    if(g_merge_config_token_2_idx)
+        kh_destroy(strdict, g_merge_config_token_2_idx);
+    if(g_merge_config.info_field2action)
+        kh_destroy(strdict, g_merge_config.info_field2action);
+    if(g_merge_config.format_field2action)
+        kh_destroy(strdict, g_merge_config.format_field2action);
+    int i=0;
+    for(i=0;i<g_merge_config.num_files;++i)
+        free(g_merge_config.file2id2action[i]);
+    if(g_merge_config.file2id2action)
+        free(g_merge_config.file2id2action);
 }
 
 static void usage(void)
@@ -2238,6 +2438,7 @@ int main_vcfmerge(int argc, char *argv[])
         {"regions",1,0,'r'},
         {"regions-file",1,0,'R'},
         {"info-rules",1,0,'i'},
+        {"merge-config",1,0,'c'},
         {0,0,0,0}
     };
     while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:l:",loptions,NULL)) >= 0) {
@@ -2271,7 +2472,8 @@ int main_vcfmerge(int argc, char *argv[])
             case  1 : args->header_fname = optarg; break;
             case  2 : args->header_only = 1; break;
             case  3 : args->force_samples = 1; break;
-            case 'h':
+            case 'c': parse_merge_config(optarg); break;
+            case 'h': 
             case '?': usage();
             default: error("Unknown argument: %s\n", optarg);
         }
@@ -2306,6 +2508,7 @@ int main_vcfmerge(int argc, char *argv[])
         for(i=0;i<args->files->nreaders;++i)
             bcf_hdr_destroy(args->files->readers[i].processed_header);
     }
+    destroy_merge_config();
     free(args);
 #ifdef DEBUG
     fclose(g_debug_fptr);

@@ -37,10 +37,17 @@ TABIX  = $(HTSDIR)/tabix
 
 #DEBUG=1
 CC=			gcc
+LDLIBS=
 ifdef DEBUG
     CFLAGS = -g -g3 -DDEBUG
 else
     CFLAGS = -O3
+endif
+
+ifdef PROFILE
+    GPERFTOOLSDIR=/home/karthikg/softwares/gperftools-2.2/install/
+    CFLAGS += -DPROFILE -I$(GPERFTOOLSDIR)/include	#-pg
+    LDLIBS += -Wl,-Bstatic -L$(GPERFTOOLSDIR)/lib -lprofiler -Wl,-Bdynamic  -lunwind -lstdc++
 endif
 CFLAGS+=	-Wall -Wc++-compat
 DFLAGS=
