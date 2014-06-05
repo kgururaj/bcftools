@@ -2204,7 +2204,6 @@ void merge_vcf(args_t *args)
         for (i=0; i<args->files->nreaders; i++)
         {
             char buf[10]; snprintf(buf,10,"%d",i+1);
-            /*bcf_hdr_merge(args->out_hdr, args->files->readers[i].header,buf,args->force_samples);*/
             bcf_hdr_t* hdr = args->files->readers[i].header;
             if(g_preprocess_vcfs)       //create duplicate header for changes
             {
@@ -2215,7 +2214,7 @@ void merge_vcf(args_t *args)
             }
             else                //else point to same header
                 args->files->readers[i].processed_header = args->files->readers[i].header;
-            bcf_hdr_merge(args->out_hdr, hdr, buf);
+            bcf_hdr_merge(args->out_hdr, hdr, buf, args->force_samples);
         }
         bcf_hdr_append_version(args->out_hdr, args->argc, args->argv, "bcftools_merge");
         bcf_hdr_sync(args->out_hdr);
