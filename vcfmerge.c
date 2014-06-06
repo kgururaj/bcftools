@@ -156,17 +156,20 @@ enum MergeActionEnum
 #define do_detach(action_type) ((action_type) == MERGE_DROP || (action_type) == MERGE_MOVE_TO_FORMAT)
 typedef struct
 {
-  int default_action;   //one of the values in MergeActionEnum
-  strdict_t* info_field2action;   //map/dict from info field name to action
-  strdict_t* format_field2action;   //map/dict from info field name to action
-  int** file2id2action;        //2D array, 1 array for each reader, maps id in BCF_DT_ID dictionary to action
-  int num_files;
+    int is_initialized;
+    int default_action;   //one of the values in MergeActionEnum
+    strdict_t* info_field2action;   //map/dict from info field name to action
+    strdict_t* format_field2action;   //map/dict from info field name to action
+    int** file2id2action;        //2D array, 1 array for each reader, maps id in BCF_DT_ID dictionary to action
+    int num_files;
 }merge_config;
 strdict_t*  g_merge_config_token_2_idx = 0;
-merge_config g_merge_config = { 0, 0, 0, 0, 0 };
+merge_config g_merge_config = { 0, 0, 0, 0, 0, 0 };
 
 int get_merge_action(const char* key_string, int is_info, int is_format)
 {
+    if(g_merge_config.is_initialized == 0)
+        return MERGE_KEEP;
     khiter_t kitr = is_info ? kh_get(strdict, g_merge_config.info_field2action, key_string)
         : kh_get(strdict, g_merge_config.format_field2action, key_string);
     int action_type =
@@ -2263,6 +2266,7 @@ void parse_merge_config(char* filename)
         fprintf(stderr,"Unable to open merge config file %s -- exiting\n",filename);
         exit(-1);
     }
+    g_merge_config.is_initialized = 1;
     int ret = 0;
     khiter_t kitr;
     //Initialize tokens (char*) to idx - so that in future we use int instead of char*
@@ -2296,73 +2300,75 @@ void parse_merge_config(char* filename)
     g_merge_config.format_field2action = kh_init(strdict);
     kh_clear(strdict, g_merge_config.format_field2action);
 
-
     char* line = 0;
     size_t linesize = 0;
     size_t length = 0;
-    kstring_t string = { 0, 0, 0 };
-    int* token_offsets = 0;
-    int num_tokens = 0;
-    int i = 0;
-    while(!feof(fptr))
+    const char* delim = " \t";
+    int line_number = 1;
+    while(1)
     {
         length = getline(&line, &linesize, fptr);
+        if(feof(fptr))
+            break;
+        if(length > 0 && line[length-1] == '\n')
+        {
+            --length;
+            line[length] = '\0';
+        }
         if(length == 0)
             continue;
-        string.s = line;
-        string.l = length;
-        string.m = linesize;
-        token_offsets = ksplit(&string, '\t', &num_tokens);
-        for(i=0;i<num_tokens;++i)
+        char* ptr = strtok(line, delim);
+        if(ptr == 0 || ptr[0] == '#')       //comment
+            continue;
+        kitr = kh_get(strdict, g_merge_config_token_2_idx, ptr);
+        if( kitr == kh_end(g_merge_config_token_2_idx) )
         {
-            char* ptr = line + token_offsets[i];
-            kitr = kh_get(strdict, g_merge_config_token_2_idx, ptr);
-            if( kitr == kh_end(g_merge_config_token_2_idx) )
-            {
-                fprintf(stderr,"Unknown token %s in merge config file\n", ptr);
-                exit(-1);
-            }
-            int type_idx = kh_val(g_merge_config_token_2_idx, kitr);
-            switch(type_idx)
-            {
-                case MERGE_DEFAULT:
-                    assert(num_tokens > i+1 && "DEFAULT token needs an argument : KEEP|DROP");
-                    ++i;
-                    ptr = line + token_offsets[i];
-                    kitr = kh_get(strdict, g_merge_config_token_2_idx, ptr);
-                    assert(kitr != kh_end(g_merge_config_token_2_idx) && "Argument to DEFAULT must be KEEP|DROP");
-                    g_merge_config.default_action = kh_val(g_merge_config_token_2_idx, kitr);
-                    break;
-                case MERGE_INFO:
-                case MERGE_FORMAT:
-                    assert(num_tokens > i+2 && "INFO/FORMAT token needs 2 arguments : FIELD_NAME KEEP|DROP");
-                    char* field = line + token_offsets[i+1];
-                    ptr = line + token_offsets[i+2];
-                    i += 2;
-                    kitr = kh_get(strdict, g_merge_config_token_2_idx, ptr);
-                    assert(kitr != kh_end(g_merge_config_token_2_idx) && "Action to INFO/FORMAT must be KEEP|DROP");
-                    int action_type = kh_val(g_merge_config_token_2_idx, kitr);
-                    assert((action_type == MERGE_KEEP || action_type == MERGE_DROP || action_type == MERGE_MOVE_TO_FORMAT)
-                            && "Action to INFO/FORMAT must be KEEP|DROP|MOVE_TO_FORMAT");
-                    if(type_idx == MERGE_INFO)
-                    {
-                        kh_put(strdict, g_merge_config.info_field2action, field, &ret);
-                        kitr = kh_get(strdict, g_merge_config.info_field2action, field);
-                        assert(kitr != kh_end(g_merge_config.info_field2action));
-                        kh_val(g_merge_config.info_field2action, kitr) = action_type;
-                    }
-                    else
-                    {
-                        kh_put(strdict, g_merge_config.format_field2action, field, &ret);
-                        kitr = kh_get(strdict, g_merge_config.format_field2action, field);
-                        assert(kitr != kh_end(g_merge_config.format_field2action));
-                        kh_val(g_merge_config.format_field2action, kitr) = action_type;
-                    }
-                    break;
-            }
+            fprintf(stderr,"Unknown token %s in line %d in merge config file %s\n", ptr, line_number, filename);
+            exit(-1);
         }
-        if(num_tokens > 0)
-            free(token_offsets);
+        int token_type = kh_val(g_merge_config_token_2_idx, kitr);
+        char* field = 0;
+        switch(token_type)
+        {
+            case MERGE_DEFAULT:
+                ptr = strtok(0, delim);
+                assert(ptr && "DEFAULT token needs an argument : KEEP|DROP");
+                kitr = kh_get(strdict, g_merge_config_token_2_idx, ptr);
+                assert(kitr != kh_end(g_merge_config_token_2_idx) && "Argument to DEFAULT must be KEEP|DROP");
+                g_merge_config.default_action = kh_val(g_merge_config_token_2_idx, kitr);
+                assert((g_merge_config.default_action == MERGE_KEEP || g_merge_config.default_action == MERGE_DROP)
+                    && "Argument to DEFAULT must be KEEP|DROP");
+                break;
+            case MERGE_INFO:
+            case MERGE_FORMAT:
+                field = strdup(strtok(0, delim));
+                ptr = strdup(strtok(0, delim)); //action
+                assert(field && ptr && "INFO/FORMAT token needs 2 arguments : FIELD_NAME KEEP|DROP etc.");
+                kitr = kh_get(strdict, g_merge_config_token_2_idx, ptr);
+                assert(kitr != kh_end(g_merge_config_token_2_idx) && "Unknown action for INFO/FORMAT");
+                int action_type = kh_val(g_merge_config_token_2_idx, kitr);
+                assert((action_type == MERGE_KEEP || action_type == MERGE_DROP || action_type == MERGE_MOVE_TO_FORMAT)
+                        && "Action to INFO/FORMAT must be KEEP|DROP|MOVE_TO_FORMAT");
+                if(token_type == MERGE_INFO)
+                {
+                    kh_put(strdict, g_merge_config.info_field2action, field, &ret);
+                    kitr = kh_get(strdict, g_merge_config.info_field2action, field);
+                    assert(kitr != kh_end(g_merge_config.info_field2action));
+                    kh_val(g_merge_config.info_field2action, kitr) = action_type;
+                }
+                else
+                {
+                    kh_put(strdict, g_merge_config.format_field2action, field, &ret);
+                    kitr = kh_get(strdict, g_merge_config.format_field2action, field);
+                    assert(kitr != kh_end(g_merge_config.format_field2action));
+                    kh_val(g_merge_config.format_field2action, kitr) = action_type;
+                }
+                break;
+            default:
+                fprintf(stderr,"Unexpected token %s at line %d .. skipping to next line\n",ptr,line_number);
+                break;
+        }
+        ++line_number;
     }
     if(line != 0)
         free(line);
@@ -2371,17 +2377,32 @@ void parse_merge_config(char* filename)
 
 void destroy_merge_config()
 {
-    if(g_merge_config_token_2_idx)
-        kh_destroy(strdict, g_merge_config_token_2_idx);
-    if(g_merge_config.info_field2action)
-        kh_destroy(strdict, g_merge_config.info_field2action);
-    if(g_merge_config.format_field2action)
-        kh_destroy(strdict, g_merge_config.format_field2action);
     int i=0;
-    for(i=0;i<g_merge_config.num_files;++i)
-        free(g_merge_config.file2id2action[i]);
+#define DESTROY_STRING_KEYS(h)                          \
+    for(i=0;i<kh_end(h);++i)                            \
+        if(kh_exist(h,i))                               \
+            free((void*)kh_key(h,i));                
+    if(g_merge_config_token_2_idx)
+    {
+        //strings are not dynamically allocated for this dict - const char* literals
+        kh_destroy(strdict, g_merge_config_token_2_idx);
+    }
+    if(g_merge_config.info_field2action)
+    {
+        DESTROY_STRING_KEYS(g_merge_config.info_field2action);
+        kh_destroy(strdict, g_merge_config.info_field2action);
+    }
+    if(g_merge_config.format_field2action)
+    {
+        DESTROY_STRING_KEYS(g_merge_config.format_field2action);
+        kh_destroy(strdict, g_merge_config.format_field2action);
+    }
     if(g_merge_config.file2id2action)
+    {
+        for(i=0;i<g_merge_config.num_files;++i)
+            free(g_merge_config.file2id2action[i]);
         free(g_merge_config.file2id2action);
+    }
 }
 
 static void usage(void)
@@ -2419,7 +2440,8 @@ int main_vcfmerge(int argc, char *argv[])
     int regions_is_file = 0;
 #ifdef DEBUG
     g_debug_fptr = fopen("debug.txt","w");
-    g_vcf_debug_fptr = stdout;
+    /*g_vcf_debug_fptr = stdout;*/
+    g_vcf_debug_fptr = g_debug_fptr;
     ks_resize(&g_debug_string, 4096);   //4KB
 #endif
 
@@ -2440,7 +2462,7 @@ int main_vcfmerge(int argc, char *argv[])
         {"merge-config",1,0,'c'},
         {0,0,0,0}
     };
-    while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:l:",loptions,NULL)) >= 0) {
+    while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:l:c:",loptions,NULL)) >= 0) {
         switch (c) {
             case 'l': args->file_list = optarg; break;
             case 'i': args->info_rules = optarg; break;
