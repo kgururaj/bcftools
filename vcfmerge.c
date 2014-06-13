@@ -136,7 +136,8 @@ kstring_t g_debug_string = { 0, 0, 0 };
 #else
 #define ASSERT(X) ;
 #endif
-unsigned g_preprocess_vcfs = 1;
+unsigned g_preprocess_vcfs = 0;
+unsigned g_is_input_gvcf = 1;
 const char* g_info2format_suffix = "_INFO";
 
 //Merge configuration
@@ -565,6 +566,8 @@ void normalize_alleles(char **als, int nals)
  * @b:      alleles to be merged, the array will be expanded as required
  * @nb:     number of $b alleles (ptr because this int will be changed)
  * @mb:     size of $b
+ * @is_split_record: A terrible hack, flag set to 1, if the BCF record for this allele was produced
+ *          by a gVCF interval split (I'll stand in the corner for now)
  *
  * Returns NULL on error or $b expanded to incorporate $a alleles and sets
  * $map. Best explained on an example:
@@ -577,7 +580,7 @@ void normalize_alleles(char **als, int nals)
  * Here the mapping from the original $a alleles to the new $b alleles is 0->0,
  * 1->2, and 2->3.
  */
-char **merge_alleles(char **a, int na, int *map, char **b, int *nb, int *mb)
+char **merge_alleles(char **a, int na, int *map, char **b, int *nb, int *mb, int is_split_record)
 {
     // reference allele never changes
     map[0] = 0;
@@ -586,11 +589,20 @@ char **merge_alleles(char **a, int na, int *map, char **b, int *nb, int *mb)
     int rla = !a[0][1] ? 1 : strlen(a[0]);
     int rlb = !b[0][1] ? 1 : strlen(b[0]);
 
+    if(is_split_record)
+        rla = 1;
+
     // the most common case: same SNPs
     if ( na==2 && *nb==2 && rla==1 && rlb==1 && a[1][0]==b[1][0] && !a[1][1] && !b[1][1] )
     {
         map[1] = 1;
         return b;
+    }
+
+    if(is_split_record)
+    {
+        a[0][0] = b[0][0];
+        a[0][1] = '\0';
     }
 
     // Sanity check: reference prefixes must be identical
@@ -705,9 +717,9 @@ void maux_destroy(maux_t *ma)
 }
 void maux_expand1(maux_t *ma, int i)
 {
-    if ( ma->nbuf[i] <= ma->files->readers[i].nbuffer )
+    if ( ma->nbuf[i] <= ma->files->readers[i].last_valid_record_idx )
     {
-        int n = ma->files->readers[i].nbuffer + 1;
+        int n = ma->files->readers[i].last_valid_record_idx + 1;
         ma->d[i] = (maux1_t*) realloc(ma->d[i], sizeof(maux1_t)*n);
         memset(ma->d[i]+ma->nbuf[i],0,sizeof(maux1_t)*(n-ma->nbuf[i]));
         ma->nbuf[i] = n;
@@ -1602,6 +1614,57 @@ void debug_buffer(FILE *fp, bcf_sr_t *reader);
 
 #define SWAP(type_t,a,b) { type_t tmp = (a); (a) = (b); (b) = tmp; }
 
+/**
+ *  Add a new BCF record produced during gVCF merges to the reader's buffer
+ *  @args:  needed to expan maux structure
+ *  @reader_idx: reader index to which the BCF record must be added
+ *  @record: New BCF record created during gVCF merge
+ *  @add_after_last_record : boolean flag telling whether the record should be added after last record
+ *  Logic: invariant: reader->buffer[last_valid_record_idx] contains the last record
+ *  Two cases:
+ *      1. For the reader, EOF has been seen. In this case, [last_valid_record_idx] contains a record with same pos as previous
+ *      So, the new record, which has a larger pos, should be added after last_valid_record_idx
+ *      2. Middle of the file. In this case, [last_valid_record_idx] contains a record with different pos as previous
+ *      So, the new record will have a smaller pos value than last_valid_record_idx and should be inserted before the last record
+ *  The boolean flag add_after_last_record distinguishes the 2 cases
+ */
+void bcf_sr_add_split_record(args_t *args, int reader_idx, bcf1_t* record, int add_after_last_record)
+{
+    bcf_srs_t *files = args->files;
+    maux_t *maux = args->maux;
+    bcf_sr_t* reader = &(files->readers[reader_idx]);
+    //Check if space is available to add new record
+    if ( reader->last_valid_record_idx+1 >= reader->mbuffer ) 
+    {
+        // Increase buffer size
+        reader->mbuffer += 8;
+        reader->buffer = (bcf1_t**) realloc(reader->buffer, sizeof(bcf1_t*)*reader->mbuffer);
+        int i = 0;
+        for (i=8; i>0; i--)     // initialize
+        {
+            reader->buffer[reader->mbuffer-i] = bcf_init1();
+            reader->buffer[reader->mbuffer-i]->max_unpack = files->max_unpack;
+            reader->buffer[reader->mbuffer-i]->pos = -1;    // for rare cases when VCF starts from 1
+        }
+    }
+    ASSERT(reader->last_valid_record_idx+1 < reader->mbuffer);
+    //Free position after last_valid_record_idx
+    if(reader->buffer[reader->last_valid_record_idx+1])
+        bcf_destroy(reader->buffer[reader->last_valid_record_idx+1]);
+    if(add_after_last_record)
+        reader->buffer[reader->last_valid_record_idx+1] = record;
+    else
+    {
+        //Shift down last_valid_record_idx
+        reader->buffer[reader->last_valid_record_idx+1] = reader->buffer[reader->last_valid_record_idx];
+        //Enter record into last_valid_record_idx
+        reader->buffer[reader->last_valid_record_idx] = record;
+    }
+    //increment last_valid_record_idx, now nbuffer and last_valid_record_idx are different
+    ++(reader->last_valid_record_idx);
+    maux_expand1(maux, reader_idx);
+}
+
 // Clean the reader's buffer to and make it ready for the next next_line() call.
 // Moves finished records (SKIP_DONE flag set) at the end of the buffer and put
 // the rest to the beggining. Then shorten the buffer so that the last element
@@ -1624,7 +1687,18 @@ void shake_buffer(maux_t *maux, int ir, int pos)
     // fprintf(fp,"--\n");
 
     int a = 1, b = reader->nbuffer;
+    //Either nbuffer entry has different pos or this is the last set of records
+    ASSERT(reader->buffer[b]->pos != pos || reader->eof);
     if ( reader->buffer[b]->pos != pos ) b--;   // move the last line separately afterwards
+
+    //flag representing that not a single record with ->pos == pos is remaining in the buffer with status (!DONE)
+    int no_same_pos_records_remaining = 1;
+    for(i=0;i<=reader->nbuffer;++i)
+        if(reader->buffer[i]->pos == pos && !(m[i].skip&SKIP_DONE))
+        {
+            no_same_pos_records_remaining = 0;
+            break;
+        }
 
     while ( a<b )
     {
@@ -1641,13 +1715,31 @@ void shake_buffer(maux_t *maux, int ir, int pos)
 
     if ( a<reader->nbuffer )
     {
+        //Either nbuffer entry has different pos or this is the last set of records
+        ASSERT(reader->buffer[reader->nbuffer]->pos != pos || reader->eof);
         // there is a gap between the unfinished lines at the beggining and the
         // last line. The last line must be brought forward to fill the gap
+        // For gVCFs, nbuffer and last_valid_record_idx are different
+        //      Move all records from [nbuffer:last_valid_record_idx] up
         if ( reader->buffer[reader->nbuffer]->pos != pos )
         {
-            SWAP(bcf1_t*, reader->buffer[a], reader->buffer[reader->nbuffer]);
-            SWAP(maux1_t, m[a], m[reader->nbuffer]);
+            int diff = reader->last_valid_record_idx - reader->nbuffer;
+            int iter = 0;
+            for(iter=0;iter<=diff;++iter)
+            {
+                SWAP(bcf1_t*, reader->buffer[a+iter], reader->buffer[reader->nbuffer+iter]);
+                SWAP(maux1_t, m[a+iter], m[reader->nbuffer+iter]);
+            }
             reader->nbuffer = a;
+            reader->last_valid_record_idx = a + diff;
+        }
+        else
+        {
+            //Part of last set of records in file, all with the same pos value
+            //Records that are !DONE have been moved up by the while(a<b) loop
+            //Point to the record before that
+            reader->nbuffer = a-1;
+            reader->last_valid_record_idx = a-1;
         }
     }
 
@@ -1655,33 +1747,58 @@ void shake_buffer(maux_t *maux, int ir, int pos)
     {
         // the first record is unfinished, replace it with an empty line
         // from the end of the buffer or else next_line will remove it
-        if ( reader->nbuffer + 1 >= maux->nbuf[ir] )
+        if ( reader->last_valid_record_idx + 1 >= maux->nbuf[ir] ) 
         {
-            reader->nbuffer++;
+            reader->last_valid_record_idx++;
             maux_expand1(maux, ir);
-            reader->nbuffer--;
+            reader->last_valid_record_idx--;
             m = maux->d[ir];
         }
-        if ( reader->nbuffer+1 >= reader->mbuffer )
-            error("Uh, did not expect this: %d vs %d\n", reader->nbuffer,reader->mbuffer);
+        if ( reader->last_valid_record_idx+1 >= reader->mbuffer ) 
+            error("Uh, did not expect this: %d vs %d\n", reader->last_valid_record_idx,reader->mbuffer);
 
         if ( reader->buffer[reader->nbuffer]->pos!=pos )
         {
             // 4way swap
             bcf1_t *tmp = reader->buffer[0];
-            reader->buffer[0] = reader->buffer[reader->nbuffer+1];
-            reader->buffer[reader->nbuffer+1] = reader->buffer[reader->nbuffer];
+            //Copy a 'dummy'/invalid entry to idx 0
+            //Required to ensure that bcf1_t* is freed correctly later
+            reader->buffer[0] = reader->buffer[reader->last_valid_record_idx+1];
+            //shift down all entries from [nbuffer:last_valid_record_idx] 
+            //For gVCFs, last_valid_record_idx and nbuffer are different
+            int j = 0;
+            for(j=reader->last_valid_record_idx;j>=reader->nbuffer;--j)
+            {
+                reader->buffer[j+1] = reader->buffer[j];
+                m[j+1].skip = SKIP_DIFF;
+            }
+            //Put 0 into the place where nbuffer was
             reader->buffer[reader->nbuffer] = tmp;
             m[reader->nbuffer].skip   = m[0].skip;
-            m[reader->nbuffer+1].skip = SKIP_DIFF;
-            reader->nbuffer++;
+            //maintain invariant : reader->nbuffer should point to BCF record with diff pos, pushed down
+            ++(reader->nbuffer);
+            //last valid entry was pushed down
+            ++(reader->last_valid_record_idx);
         }
         else
         {
+            //Either nbuffer entry has different pos or this is the last set of records
+            ASSERT(reader->eof);
+            //No extra split records have been added
+            ASSERT(reader->nbuffer == reader->last_valid_record_idx);
+            //FIXME: This seems wrong - nbuffer is not updated, and entry 0 is moved beyond nbuffer
             SWAP(bcf1_t*, reader->buffer[0], reader->buffer[reader->nbuffer+1]);
             SWAP(maux1_t, m[0], m[reader->nbuffer+1]);
+            ASSERT(0);
         }
     }
+
+    int new_split_records_added = (reader->nbuffer != reader->last_valid_record_idx);
+    //If new split records are added in this round to this reader and all the current records 
+    //with ->pos == pos are processed (SKIP_DONE), then new split records should be merged in the next
+    //round. To do this correctly, set nbuffer to last_valid_record_idx. 
+    if(no_same_pos_records_remaining && new_split_records_added)
+        reader->nbuffer = reader->last_valid_record_idx;
 
     // debug_buffer(fp,reader);
     // fprintf(fp,"<shaken>\t"); for (i=0; i<reader->nbuffer; i++) fprintf(fp," %d", skip[i]);
@@ -1692,9 +1809,13 @@ void shake_buffer(maux_t *maux, int ir, int pos)
     reader->buffer[0]->pos = -1;
 
     // trim the buffer, remove finished lines from the end
+    // TODO: Is this loop even executed? the if(a<reader->nbuffer) should have handled it
     i = reader->nbuffer;
     while ( i>=1 && m[i--].skip&SKIP_DONE )
+    {
+        ASSERT(0);
         reader->nbuffer--;
+    }
 }
 
 void debug_maux(args_t *args, int pos, int var_type)
@@ -1865,6 +1986,138 @@ bcf1_t* preprocess_line(args_t* args, bcf_sr_t* reader, int file_idx)
     return new_line;
 }
 
+//Say we are merging 3 samples S1, S2, S3
+//The current records for both S1 and S2 start at position 100, end at 400 and 1000 respectively
+//The next record for S3 starts at position 300
+//The end point for the current interval to be merged is min (400, 1000, 300-1)
+//find_end_position computes this end point
+int find_end_position(bcf_srs_t* files)
+{
+    int i = 0;
+    int j = 0;
+    int end_point = INT32_MAX;
+    int* tmp_end_ptr = (int*)malloc(sizeof(int));
+    int curr_end_point = 0;
+    int length = 0;
+    for(i=0;i<files->nreaders;++i)
+    {
+        bcf_sr_t* curr_reader = &(files->readers[i]);
+        bcf_hdr_t* curr_header = curr_reader->header;
+        if(bcf_sr_has_line(files, i))
+        {
+            int curr_pos = curr_reader->buffer[0]->pos;
+            //Multiple VCF records could have same position in a given file
+            for(j=0;j<=curr_reader->nbuffer;++j)
+            {
+                bcf1_t* curr_record = curr_reader->buffer[j];
+                ASSERT(curr_record && curr_record->pos >= 0);
+                //same pos check is necessary because of weird nature of nbuffer
+                //for EOF records, buffer[nbuffer] record has same pos as others
+                //in other cases, buffer[nbuffer] record has different pos as others
+                if(curr_record->pos == curr_pos)
+                {
+                    //TODO: never search for strings while merging records, instead pre-compute and store idx somewhere
+                    //either not present or present, no type errors. if found, END should be scalar
+                    int status = bcf_get_info_int32(curr_header,curr_record,"END",&tmp_end_ptr,&length);
+                    ASSERT(status == -3 || (status >= 0 && length == 1)); 
+                    if(status < 0)
+                        curr_end_point = curr_record->pos;   //single position, end point same as position
+                    else
+                        //TODO: is this true for BCFs
+                        curr_end_point = (*tmp_end_ptr) - 1;    //why the -1? when VCFs are parsed, pos field begins from 0
+                    if(end_point > curr_end_point)
+                        end_point = curr_end_point;
+                }
+            }
+        }
+        else    //does not have the line, meaning min position record begins at greater start position
+        {
+            if(curr_reader->nbuffer)
+            {
+                bcf1_t* curr_record = curr_reader->buffer[1];   //should be min position record
+                ASSERT(curr_record && curr_record->pos != -1);
+                //start of this record is <= current value of end
+                if(end_point > curr_record->pos-1)
+                    end_point = curr_record->pos-1;
+            }
+        }
+    }
+    ASSERT(end_point != INT32_MAX);
+    free(tmp_end_ptr);
+    return end_point;
+}
+
+//Say we are merging 3 samples S1, S2, S3
+//The current records for both S1 and S2 start at position 100, end at 400 and 1000 respectively
+//The next record for S3 starts at position 300
+//The end point for the current interval to be merged is min (400, 1000, 300-1)
+//align_to_end aligns end points of all records to merge in this round to end_point
+//For our example, the intervals of S1 and S2 to be merged now become (100, 299)
+//Additional bcf records are created for intervals (300-400) for S1 and (300-1000) for S2
+//These additional records are stored at the end of the buffer - since mbuffer >= nbuffer+1
+//S3 is not touched
+void align_to_end(args_t* args, int new_end_point)
+{
+    int i = 0;
+    int j = 0;
+    //why the +1? when VCFs are parsed, pos field begins from 0, however END field is not handled similarly, have to do this explicity
+    int info_end_point = new_end_point + 1;    
+    int* end_point_ptr = (int*)malloc(sizeof(int));
+    int length = 0;
+    bcf_srs_t* files = args->files;
+    for(i=0;i<files->nreaders;++i)
+    {
+        bcf_sr_t* curr_reader = &(files->readers[i]);
+        bcf_hdr_t* curr_header = curr_reader->header;
+        //Only files with the min start position are considered
+        if(bcf_sr_has_line(files, i))
+        {
+            int curr_pos = curr_reader->buffer[0]->pos;
+            //Last set of records from the reader
+            int is_last_record_set = (curr_reader->buffer[curr_reader->nbuffer]->pos == curr_pos);
+            int num_split_records_added = 0;
+            for(j=0;j<=curr_reader->nbuffer;++j)
+            {
+                bcf1_t* curr_record = curr_reader->buffer[j];
+                ASSERT(curr_record && curr_record->pos >= 0);
+                //same pos check is necessary because of weird nature of nbuffer
+                //for EOF records, buffer[nbuffer] record has same pos as others
+                //in other cases, buffer[nbuffer] record has different pos as others
+                if(curr_record->pos == curr_pos)
+                {
+                    //TODO: never search for strings while merging records, instead pre-compute and store idx somewhere
+                    int status = bcf_get_info_int32(curr_header,curr_record,"END",&end_point_ptr, &length);
+                    //either not present or present, no type errors. if found, END should be scalar
+                    ASSERT(status == -3 || (status >= 0 && length == 1)); 
+                    int end_point = 0;
+                    if(status < 0)
+                        end_point = curr_record->pos;   //single position, end point same as position
+                    else
+                        end_point = (*end_point_ptr) - 1;//why the -1? when VCFs are parsed, pos field begins from 0
+                    ASSERT(end_point >= new_end_point);
+                    if(end_point > new_end_point)      //need to split record
+                    {
+                        bcf1_t* duplicate = bcf_dup(curr_record);
+                        //set end position for current record
+                        bcf_update_info_int32(curr_header, curr_record, "END", &info_end_point, 1);
+                        //set start position of duplicate record
+                        duplicate->pos = new_end_point+1;
+                        //FIXME: Horrible, horrible HACK
+                        duplicate->is_split_record = 1;
+                        bcf_sr_add_split_record(args, i, duplicate, is_last_record_set);
+                        ++num_split_records_added;
+                    }
+                }
+            }
+            //Update the value of nbuffer
+            if(num_split_records_added > 0)
+                if(is_last_record_set)
+                    ++(curr_reader->nbuffer);
+        }
+    }
+    free(end_point_ptr);
+}
+
 // Determine which line should be merged from which reader: go through all
 // readers and all buffered lines, expand REF,ALT and try to match lines with
 // the same ALTs. A step towards output independent on input ordering of the
@@ -1875,7 +2128,35 @@ void merge_buffer(args_t *args)
     int i, pos = -1, var_type = 0;
     char *id = NULL;
     maux_t *maux = args->maux;
+    //Same buffer could produce lots of lines for gVCFs
+    //Invariant at the beginning of every iteration:
+    // buffer[0] contains valid record with min. position for all samples which have a record at that position, invalid = -1
+    // reader->nbuffer - Confusing usage
+    // The best way to remember is that it is the idx in reader->buffer at which the last record read from file is stored
+    // In the normal case, the pos of buffer[nbuffer] is different from all the previous records is located.
+    // The exception is when EOF is reached, at that point buffer[nbuffer] has same pos as previous records
+    //    case 1: reader has a valid record at idx 0, implying reader contains a min-position record to merge now
+    //       [0:nbuffer-1]: valid records with same pos 
+    //       [nbuffer]: valid record with different pos value
+    //       The number of valid entries is nbuffer+1
+    //    case 2: reader has no valid entry at idx 0, reader contains no record to be merged now
+    //       0: invalid BCF record
+    //       [1:nbuffer-1]: valid records with same pos
+    //       [nbuffer]: valid record with different post value
+    //       The number of valid entries is nbuffer
+
+    int i, pos = -1, var_type = 0;
     maux_reset(maux);
+
+    int end_point = -1;
+    //Find the 'end' point where interval has to 'break' in gVCFs
+    //Create intervals with the end position
+    //TODO: compute end points once before the while loop using sorting
+    if(g_is_input_gvcf)
+    {
+        end_point = find_end_position(files);
+        align_to_end(args, end_point);
+    }
 
     // set the current position
     for (i=0; i<files->nreaders; i++)
@@ -1889,7 +2170,7 @@ void merge_buffer(args_t *args)
             break;
         }
     }
-    //TODO - iterate using minimum position and only those with minimum
+
     // In this loop we select from each reader compatible candidate lines.
     // (i.e. SNPs or indels). Go through all files and all lines at this
     // position and normalize relevant alleles.
@@ -1952,7 +2233,7 @@ void merge_buffer(args_t *args)
             }
 
             // normalize alleles
-            maux->als = merge_alleles(line->d.allele, line->n_allele, maux->d[i][j].map, maux->als, &maux->nals, &maux->mals);
+            maux->als = merge_alleles(line->d.allele, line->n_allele, maux->d[i][j].map, maux->als, &maux->nals, &maux->mals, line->is_split_record);
             if ( !maux->als ) error("Failed to merge alleles at %s:%d\n",bcf_seqname(args->out_hdr,line),line->pos+1);
             hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
             for (k=1; k<line->n_allele; k++)
@@ -2114,8 +2395,14 @@ void preprocess_header(bcf_hdr_t* src_hdr, int file_idx)
             int action_type = get_merge_action(key_string, is_info, is_format);
             //Used in preprocess_line to quickly lookup action from id (integer id)
             g_merge_config.file2id2action[file_idx][i] = action_type;
-
-            if(!do_detach(action_type)) //either keep,min,max etc, but do not detach (drop or move)
+            //END in INFO has special significance
+            if(is_info && strcmp(key_string,"END") == 0)        
+            {
+                g_merge_config.file2id2action[file_idx][i] = MERGE_KEEP;  //keep END in INFO always
+                continue;
+            }
+            // Is the action keep,min,max etc, but does not involve detach (drop or move)
+            if(!do_detach(action_type)) 
                 continue;
             //Mark for removal
             ASSERT(erase_idx < hdr->n[BCF_DT_ID]);
@@ -2191,6 +2478,8 @@ void merge_vcf(args_t *args)
     args->out_fh  = hts_open(args->output_fname, hts_bcf_wmode(args->output_type));
     if ( args->out_fh == NULL ) error("Can't write to \"%s\": %s\n", args->output_fname, strerror(errno));
     args->out_hdr = bcf_hdr_init("w");
+    //set collapse - BUG in original code; needed for sync_reader to work correctly
+    args->files->collapse = args->collapse;
 
     if ( args->header_fname )
     {
@@ -2267,6 +2556,7 @@ void parse_merge_config(char* filename)
         exit(-1);
     }
     g_merge_config.is_initialized = 1;
+    g_preprocess_vcfs = 1;
     int ret = 0;
     khiter_t kitr;
     //Initialize tokens (char*) to idx - so that in future we use int instead of char*
@@ -2440,8 +2730,8 @@ int main_vcfmerge(int argc, char *argv[])
     int regions_is_file = 0;
 #ifdef DEBUG
     g_debug_fptr = fopen("debug.txt","w");
-    /*g_vcf_debug_fptr = stdout;*/
-    g_vcf_debug_fptr = g_debug_fptr;
+    g_vcf_debug_fptr = stdout;
+    /*g_vcf_debug_fptr = g_debug_fptr;*/
     ks_resize(&g_debug_string, 4096);   //4KB
 #endif
 
@@ -2459,7 +2749,7 @@ int main_vcfmerge(int argc, char *argv[])
         {"regions",1,0,'r'},
         {"regions-file",1,0,'R'},
         {"info-rules",1,0,'i'},
-        {"merge-config",1,0,'c'},
+        {"merge-config",1,0,'X'},
         {0,0,0,0}
     };
     while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:l:c:",loptions,NULL)) >= 0) {
@@ -2493,7 +2783,7 @@ int main_vcfmerge(int argc, char *argv[])
             case  1 : args->header_fname = optarg; break;
             case  2 : args->header_only = 1; break;
             case  3 : args->force_samples = 1; break;
-            case 'c': parse_merge_config(optarg); break;
+            case 'X': parse_merge_config(optarg); break;
             case 'h': 
             case '?': usage();
             default: error("Unknown argument: %s\n", optarg);
@@ -2533,6 +2823,7 @@ int main_vcfmerge(int argc, char *argv[])
     free(args);
 #ifdef DEBUG
     fclose(g_debug_fptr);
+    free(g_debug_string.s);
 #endif
     return 0;
 }
