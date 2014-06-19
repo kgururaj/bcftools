@@ -34,6 +34,8 @@ THE SOFTWARE.  */
 #include <ctype.h>
 #include "bcftools.h"
 #include "vcmp.h"
+/*For gVCFs reference is needed to get base pair at interval split locations*/
+#include <htslib/faidx.h>
 
 #include <htslib/khash.h>
 KHASH_MAP_INIT_STR(strdict, int)
@@ -119,6 +121,14 @@ typedef struct
     bcf1_t *out_line;
     htsFile *out_fh;
     bcf_hdr_t *out_hdr;
+    //reference genome access - required for gVCF merge
+    char* reference_filename;
+    faidx_t* reference_faidx;
+    char* reference_last_seq_read;
+    int reference_last_read_pos;
+    int reference_num_bases_read;
+    char* reference_buffer;
+
     char **argv;
     int argc;
 }
@@ -137,7 +147,7 @@ kstring_t g_debug_string = { 0, 0, 0 };
 #define ASSERT(X) ;
 #endif
 unsigned g_preprocess_vcfs = 0;
-unsigned g_is_input_gvcf = 1;
+unsigned g_is_input_gvcf = 0;
 const char* g_info2format_suffix = "_INFO";
 
 //Merge configuration
@@ -589,8 +599,10 @@ char **merge_alleles(char **a, int na, int *map, char **b, int *nb, int *mb, int
     int rla = !a[0][1] ? 1 : strlen(a[0]);
     int rlb = !b[0][1] ? 1 : strlen(b[0]);
 
+#ifdef USE_SPLIT_RECORD_HACK
     if(is_split_record)
         rla = 1;
+#endif
 
     // the most common case: same SNPs
     if ( na==2 && *nb==2 && rla==1 && rlb==1 && a[1][0]==b[1][0] && !a[1][1] && !b[1][1] )
@@ -599,11 +611,13 @@ char **merge_alleles(char **a, int na, int *map, char **b, int *nb, int *mb, int
         return b;
     }
 
+#ifdef USE_SPLIT_RECORD_HACK
     if(is_split_record)
     {
         a[0][0] = b[0][0];
         a[0][1] = '\0';
     }
+#endif
 
     // Sanity check: reference prefixes must be identical
     if ( strncmp(a[0],b[0],rla<rlb?rla:rlb) )
@@ -1986,16 +2000,47 @@ bcf1_t* preprocess_line(args_t* args, bcf_sr_t* reader, int file_idx)
     return new_line;
 }
 
+char get_reference_base_at_position(args_t* args, const char* seq_name, int pos)
+{
+    int length = 0;
+    ASSERT(seq_name);
+    //See if pos is within the last buffer read
+    if(strcmp(args->reference_last_seq_read, seq_name) == 0 && args->reference_last_read_pos <= pos)
+    {
+        int offset = (pos -  args->reference_last_read_pos);
+        if(offset < args->reference_num_bases_read)
+            return args->reference_buffer[offset];
+    }
+    if(args->reference_buffer)
+        free(args->reference_buffer);
+    args->reference_buffer = faidx_fetch_seq(args->reference_faidx, seq_name, pos, pos+4096, &length);
+    ASSERT(length > 0 && args->reference_buffer);
+    strcpy(args->reference_last_seq_read, seq_name);
+    args->reference_last_read_pos = pos;
+    args->reference_num_bases_read = length;
+    return args->reference_buffer[0];
+}
+
 //Say we are merging 3 samples S1, S2, S3
 //The current records for both S1 and S2 start at position 100, end at 400 and 1000 respectively
 //The next record for S3 starts at position 300
 //The end point for the current interval to be merged is min (400, 1000, 300-1)
-//find_end_position computes this end point
-int find_end_position(bcf_srs_t* files)
+//find_end_position computes and returns this end point
+//  @args : Args structure
+//  @chrom_idx: Chromosome at new start of new split interval (bcf1_t.rid)
+//  @ref_id: Pointer to a char* that corresponds to ID field in VCF. Filled with ID value at the start of new the split interval. Memory is
+//  allocated by this function and should be freed by user
+//  @ref_base: pointer to a single char, will contain the reference base at the start of new interval
+int find_end_position(args_t* args, int* chrom_idx, char** ref_id, char* ref_base)
 {
+    bcf_srs_t* files = args->files;
     int i = 0;
     int j = 0;
     int end_point = INT32_MAX;
+    int max_end_point = -1;
+    //File idx not involved in current round of merge whose start pos is min
+    int min_start_file_idx = -1;
+    int has_line_file_idx = -1;
     int* tmp_end_ptr = (int*)malloc(sizeof(int));
     int curr_end_point = 0;
     int length = 0;
@@ -2006,6 +2051,7 @@ int find_end_position(bcf_srs_t* files)
         if(bcf_sr_has_line(files, i))
         {
             int curr_pos = curr_reader->buffer[0]->pos;
+            has_line_file_idx = i;
             //Multiple VCF records could have same position in a given file
             for(j=0;j<=curr_reader->nbuffer;++j)
             {
@@ -2023,10 +2069,17 @@ int find_end_position(bcf_srs_t* files)
                     if(status < 0)
                         curr_end_point = curr_record->pos;   //single position, end point same as position
                     else
+                    {
                         //TODO: is this true for BCFs
-                        curr_end_point = (*tmp_end_ptr) - 1;    //why the -1? when VCFs are parsed, pos field begins from 0
+                        //why the -1? when VCFs are parsed, pos field begins from 0, however, END field is not modified similarly
+                        curr_end_point = (*tmp_end_ptr) - 1;
+                    }
                     if(end_point > curr_end_point)
+                    {
                         end_point = curr_end_point;
+                        min_start_file_idx = -1;
+                    }
+                    max_end_point = (curr_end_point > max_end_point) ? curr_end_point : max_end_point;
                 }
             }
         }
@@ -2037,14 +2090,79 @@ int find_end_position(bcf_srs_t* files)
                 bcf1_t* curr_record = curr_reader->buffer[1];   //should be min position record
                 ASSERT(curr_record && curr_record->pos != -1);
                 //start of this record is <= current value of end
-                if(end_point > curr_record->pos-1)
+                if(end_point >= curr_record->pos-1)
+                {
                     end_point = curr_record->pos-1;
+                    min_start_file_idx = i;
+                }
             }
         }
     }
     ASSERT(end_point != INT32_MAX);
     free(tmp_end_ptr);
+    //Determine base at end_point+1, i.e., the start of new interval that is created
+    //If the start of new interval is the start pos of one of the records in the buffer,
+    //obtain reference base etc from that record
+    if(min_start_file_idx >= 0)
+    {
+        //Not involved in this round of merging
+        ASSERT(!(bcf_sr_has_line(files, min_start_file_idx)));
+        ASSERT(files->readers[min_start_file_idx].nbuffer);
+        //Guaranteed to have have buffer idx 1 - obtain reference allele
+        bcf1_t* rec = files->readers[min_start_file_idx].buffer[1];
+        bcf_unpack(rec, BCF_UN_STR);
+        //REF + 1 variant
+        ASSERT(rec->n_allele >= 2);
+        //Chromosome id
+        (*chrom_idx) = rec->rid;
+        //ID field
+        (*ref_id) = strdup(rec->d.id);
+        ASSERT(*ref_id);
+        //First base of reference allele - REF
+        (*ref_base) = rec->d.allele[0][0];
+    }
+    else        //else obtain base from reference fasta file
+    {
+        //At least one split interval will be created, obtain REF fields from 
+        if(max_end_point > end_point)
+        {
+            ASSERT(has_line_file_idx >= 0);
+            bcf_sr_t* reader = &(files->readers[has_line_file_idx]);
+            bcf1_t* rec = reader->buffer[0];
+            int rid = rec->rid;
+            //Chromosome id
+            (*chrom_idx) = rid;
+            //ID field - set to empty (NULL) since we don't know the ID at new interval's position
+            (*ref_id) = 0;
+            //First base of reference allele - REF, obtain from reference file
+            const char* contig_name = reader->header->id[BCF_DT_CTG][rid].key;
+            (*ref_base) = get_reference_base_at_position(args, contig_name, end_point+1);
+        }
+    }
     return end_point;
+}
+
+bcf1_t* create_split_record(bcf_hdr_t* curr_header, bcf1_t* curr_record, int start_pos,
+        int chrom_idx, const char* ref_id, char ref_base)
+{
+    bcf1_t* duplicate = bcf_dup(curr_record);
+    //set start position of duplicate record
+    duplicate->pos = start_pos;
+    //FIXME: Horrible, horrible HACK
+    duplicate->is_split_record = 1;
+    //update ID
+    bcf_unpack(duplicate, BCF_UN_STR);
+    bcf_update_id(curr_header, duplicate, ref_id);
+    //Update chrom idx
+    duplicate->rid = chrom_idx;
+    //Update ref_base
+    //Guaranteed to be of size 2 at least
+    duplicate->d.allele[0][0] = ref_base;
+    duplicate->d.allele[0][1] = '\0';
+    //According to update_alleles, can re-use same memory
+    bcf_update_alleles(curr_header, duplicate, (const char**)duplicate->d.allele,
+            duplicate->n_allele);
+    return duplicate;
 }
 
 //Say we are merging 3 samples S1, S2, S3
@@ -2056,12 +2174,13 @@ int find_end_position(bcf_srs_t* files)
 //Additional bcf records are created for intervals (300-400) for S1 and (300-1000) for S2
 //These additional records are stored at the end of the buffer - since mbuffer >= nbuffer+1
 //S3 is not touched
-void align_to_end(args_t* args, int new_end_point)
+void align_to_end(args_t* args, int new_end_point, int chrom_idx, const char* ref_id, char ref_base)
 {
     int i = 0;
     int j = 0;
+    int* info_end_point = (int*)malloc(sizeof(int));
     //why the +1? when VCFs are parsed, pos field begins from 0, however END field is not handled similarly, have to do this explicity
-    int info_end_point = new_end_point + 1;    
+    info_end_point[0] = new_end_point + 1;    
     int* end_point_ptr = (int*)malloc(sizeof(int));
     int length = 0;
     bcf_srs_t* files = args->files;
@@ -2097,13 +2216,11 @@ void align_to_end(args_t* args, int new_end_point)
                     ASSERT(end_point >= new_end_point);
                     if(end_point > new_end_point)      //need to split record
                     {
-                        bcf1_t* duplicate = bcf_dup(curr_record);
+                        //create new record identical to curr_record except that it starts at new_end_point+1
+                        bcf1_t* duplicate = create_split_record(curr_header, curr_record, new_end_point+1, chrom_idx, ref_id, ref_base);
                         //set end position for current record
-                        bcf_update_info_int32(curr_header, curr_record, "END", &info_end_point, 1);
-                        //set start position of duplicate record
-                        duplicate->pos = new_end_point+1;
-                        //FIXME: Horrible, horrible HACK
-                        duplicate->is_split_record = 1;
+                        bcf_update_info_int32(curr_header, curr_record, "END", info_end_point, 1);
+                        //add to reader->buffer
                         bcf_sr_add_split_record(args, i, duplicate, is_last_record_set);
                         ++num_split_records_added;
                     }
@@ -2115,6 +2232,7 @@ void align_to_end(args_t* args, int new_end_point)
                     ++(curr_reader->nbuffer);
         }
     }
+    free(info_end_point);
     free(end_point_ptr);
 }
 
@@ -2154,8 +2272,13 @@ void merge_buffer(args_t *args)
     //TODO: compute end points once before the while loop using sorting
     if(g_is_input_gvcf)
     {
-        end_point = find_end_position(files);
-        align_to_end(args, end_point);
+        int chrom_idx = -1;
+        char* ref_id = 0;
+        char ref_base = 0;
+        end_point = find_end_position(args, &chrom_idx, &ref_id, &ref_base);
+        align_to_end(args, end_point, chrom_idx, ref_id, ref_base);
+        if(ref_id)
+            free(ref_id);
     }
 
     // set the current position
@@ -2547,6 +2670,31 @@ void merge_vcf(args_t *args)
     if ( args->vcmp ) vcmp_destroy(args->vcmp);
 }
 
+void initialize_reference(args_t* args, const char* reference_filename)
+{
+    args->reference_filename = strdup(reference_filename);
+    assert(args->reference_filename && "char* storing reference file name in args is NULL");
+    /*args->reference_fp = gzopen(argv[1], "r");*/
+    /*assert(args->reference_fp != Z_NULL && "Failed to open reference file");*/
+    /*args->reference_seq = kseq_init(args->reference_fp);*/
+    /*assert(args->reference_seq && "Unable to allocate memory for reference seq");*/
+    args->reference_faidx = fai_load(args->reference_filename);
+    assert(args->reference_faidx);
+    args->reference_last_seq_read = (char*)calloc(4096, sizeof(char));
+}
+
+void destroy_reference(args_t* args)
+{
+    if(args->reference_filename)
+    {
+        fai_destroy(args->reference_faidx);
+        free(args->reference_filename);
+        free(args->reference_last_seq_read);
+        if(args->reference_buffer)
+            free(args->reference_buffer);
+    }
+}
+
 void parse_merge_config(char* filename)
 {
     FILE* fptr = fopen(filename,"r");
@@ -2718,6 +2866,13 @@ static void usage(void)
     exit(1);
 }
 
+enum ArgsIdxEnum
+{
+  ARGS_IDX_MERGE_CONFIG_FILE=1000,
+  ARGS_IDX_REFERENCE_FILE,
+  ARGS_IDX_INPUT_GVCFS
+};
+
 int main_vcfmerge(int argc, char *argv[])
 {
     int c;
@@ -2730,7 +2885,7 @@ int main_vcfmerge(int argc, char *argv[])
     int regions_is_file = 0;
 #ifdef DEBUG
     g_debug_fptr = fopen("debug.txt","w");
-    g_vcf_debug_fptr = stdout;
+    g_vcf_debug_fptr = stderr;
     /*g_vcf_debug_fptr = g_debug_fptr;*/
     ks_resize(&g_debug_string, 4096);   //4KB
 #endif
@@ -2749,10 +2904,12 @@ int main_vcfmerge(int argc, char *argv[])
         {"regions",1,0,'r'},
         {"regions-file",1,0,'R'},
         {"info-rules",1,0,'i'},
-        {"merge-config",1,0,'X'},
+        {"merge-config",1,0,ARGS_IDX_MERGE_CONFIG_FILE},
+        {"reference",1,0,ARGS_IDX_REFERENCE_FILE},
+        {"gvcf",0,0,ARGS_IDX_INPUT_GVCFS},
         {0,0,0,0}
     };
-    while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:l:c:",loptions,NULL)) >= 0) {
+    while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:l:",loptions,NULL)) >= 0) {
         switch (c) {
             case 'l': args->file_list = optarg; break;
             case 'i': args->info_rules = optarg; break;
@@ -2783,7 +2940,9 @@ int main_vcfmerge(int argc, char *argv[])
             case  1 : args->header_fname = optarg; break;
             case  2 : args->header_only = 1; break;
             case  3 : args->force_samples = 1; break;
-            case 'X': parse_merge_config(optarg); break;
+            case ARGS_IDX_MERGE_CONFIG_FILE: parse_merge_config(optarg); break;
+            case ARGS_IDX_REFERENCE_FILE: initialize_reference(args, optarg); break;
+            case ARGS_IDX_INPUT_GVCFS: g_is_input_gvcf = 1; break;
             case 'h': 
             case '?': usage();
             default: error("Unknown argument: %s\n", optarg);
@@ -2791,6 +2950,8 @@ int main_vcfmerge(int argc, char *argv[])
     }
     if ( argc==optind && !args->file_list ) usage();
     if ( argc-optind<2 && !args->file_list ) usage();
+
+    assert((!g_is_input_gvcf || args->reference_filename) && "To merge gVCFs, you must provide a reference file using --reference=<filename.fa");
 
     args->files->require_index = 1;
     if ( args->regions_list && bcf_sr_set_regions(args->files, args->regions_list, regions_is_file)<0 )
@@ -2820,6 +2981,7 @@ int main_vcfmerge(int argc, char *argv[])
             bcf_hdr_destroy(args->files->readers[i].processed_header);
     }
     destroy_merge_config();
+    destroy_reference(args);
     free(args);
 #ifdef DEBUG
     fclose(g_debug_fptr);
