@@ -107,6 +107,24 @@ typedef struct
 }
 maux_t;
 
+#ifdef COLLECT_STATS
+enum StatEnum
+{
+    NUM_ACTIVE_SAMPLES_PER_LINE=0,
+    LAST_STAT_IDX
+};
+char* StatNames[] = { "num_samples_per_line", "NULL" };
+typedef unsigned long long uint64;
+typedef struct
+{
+    uint64* m_histogram;
+    unsigned m_histogram_size;
+    uint64 m_sum;
+    double m_sum_square;
+    uint64 m_count;
+}stat_struct;
+#endif
+
 typedef struct
 {
     vcmp_t *vcmp;
@@ -128,7 +146,10 @@ typedef struct
     int reference_last_read_pos;
     int reference_num_bases_read;
     char* reference_buffer;
-
+    char* m_tag;
+#ifdef COLLECT_STATS
+    stat_struct stat_array[LAST_STAT_IDX];
+#endif
     char **argv;
     int argc;
 }
@@ -197,6 +218,55 @@ int get_merge_action(const char* key_string, int is_info, int is_format)
         (curr_num_elements) = (new_num_elements);                               \
         (ptr) = (type*)realloc((ptr), (new_num_elements)*sizeof(type));         \
     }
+
+#ifdef COLLECT_STATS
+void update_stat(args_t* args, int stat_idx, int value)
+{
+    ASSERT(stat_idx >= 0 && stat_idx < LAST_STAT_IDX);
+    stat_struct* ptr = &(args->stat_array[stat_idx]);
+    ptr->m_sum += ((uint64)value);
+    double v = (double)value;
+    ptr->m_sum_square += v*v;
+    ++(ptr->m_count);
+    switch(stat_idx)
+    {
+        case NUM_ACTIVE_SAMPLES_PER_LINE:
+            ASSERT(((unsigned)value) < ptr->m_histogram_size);
+            ++(ptr->m_histogram[value]);
+            break;
+        default:
+            break;
+    }
+}
+
+void print_stats(args_t* args)
+{
+    char filename[100];
+    if(args->m_tag)
+        sprintf(filename,"%s_stats.csv",args->m_tag);
+    else
+        sprintf(filename,"stats.csv");
+    FILE* fptr = fopen(filename,"w");
+    int i = 0;
+    for(i=0;i<LAST_STAT_IDX;++i)
+    {
+        stat_struct* ptr = &(args->stat_array[i]);
+        ptr->m_count = (ptr->m_count == 0) ? 1 : ptr->m_count;
+        double mean =  ((double)(ptr->m_sum))/(ptr->m_count);
+        double variance = (ptr->m_sum_square/ptr->m_count) - (mean*mean);
+        fprintf(fptr,"%s,%llu,%llu,%lf,%lf,%lf\n",StatNames[i], ptr->m_count, ptr->m_sum, mean,
+                ptr->m_sum_square, variance);
+        if(ptr->m_histogram)
+        {
+            int j = 0;
+            for(j=0;j<ptr->m_histogram_size;++j)
+                fprintf(fptr,"%d,%llu\n",j,ptr->m_histogram[j]);
+        }
+    }
+    fclose(fptr);
+}
+#endif
+
 
 static void info_rules_merge_sum(bcf_hdr_t *hdr, bcf1_t *line, info_rule_t *rule)
 {
@@ -1121,6 +1191,8 @@ void merge_info(args_t *args, bcf1_t *out)
         for (j=0; j<line->n_info; j++) 
         {
             bcf_info_t *inf = &line->d.info[j];
+            if(inf->vptr == 0)
+                continue;
 
             const char *key = hdr->id[BCF_DT_ID][inf->key].key;
             if ( !strcmp("AC",key) || !strcmp("AN",key) ) continue;  // AC and AN are done in merge_format() after genotypes are done
@@ -1628,57 +1700,6 @@ void debug_buffer(FILE *fp, bcf_sr_t *reader);
 
 #define SWAP(type_t,a,b) { type_t tmp = (a); (a) = (b); (b) = tmp; }
 
-/**
- *  Add a new BCF record produced during gVCF merges to the reader's buffer
- *  @args:  needed to expan maux structure
- *  @reader_idx: reader index to which the BCF record must be added
- *  @record: New BCF record created during gVCF merge
- *  @add_after_last_record : boolean flag telling whether the record should be added after last record
- *  Logic: invariant: reader->buffer[last_valid_record_idx] contains the last record
- *  Two cases:
- *      1. For the reader, EOF has been seen. In this case, [last_valid_record_idx] contains a record with same pos as previous
- *      So, the new record, which has a larger pos, should be added after last_valid_record_idx
- *      2. Middle of the file. In this case, [last_valid_record_idx] contains a record with different pos as previous
- *      So, the new record will have a smaller pos value than last_valid_record_idx and should be inserted before the last record
- *  The boolean flag add_after_last_record distinguishes the 2 cases
- */
-void bcf_sr_add_split_record(args_t *args, int reader_idx, bcf1_t* record, int add_after_last_record)
-{
-    bcf_srs_t *files = args->files;
-    maux_t *maux = args->maux;
-    bcf_sr_t* reader = &(files->readers[reader_idx]);
-    //Check if space is available to add new record
-    if ( reader->last_valid_record_idx+1 >= reader->mbuffer ) 
-    {
-        // Increase buffer size
-        reader->mbuffer += 8;
-        reader->buffer = (bcf1_t**) realloc(reader->buffer, sizeof(bcf1_t*)*reader->mbuffer);
-        int i = 0;
-        for (i=8; i>0; i--)     // initialize
-        {
-            reader->buffer[reader->mbuffer-i] = bcf_init1();
-            reader->buffer[reader->mbuffer-i]->max_unpack = files->max_unpack;
-            reader->buffer[reader->mbuffer-i]->pos = -1;    // for rare cases when VCF starts from 1
-        }
-    }
-    ASSERT(reader->last_valid_record_idx+1 < reader->mbuffer);
-    //Free position after last_valid_record_idx
-    if(reader->buffer[reader->last_valid_record_idx+1])
-        bcf_destroy(reader->buffer[reader->last_valid_record_idx+1]);
-    if(add_after_last_record)
-        reader->buffer[reader->last_valid_record_idx+1] = record;
-    else
-    {
-        //Shift down last_valid_record_idx
-        reader->buffer[reader->last_valid_record_idx+1] = reader->buffer[reader->last_valid_record_idx];
-        //Enter record into last_valid_record_idx
-        reader->buffer[reader->last_valid_record_idx] = record;
-    }
-    //increment last_valid_record_idx, now nbuffer and last_valid_record_idx are different
-    ++(reader->last_valid_record_idx);
-    maux_expand1(maux, reader_idx);
-}
-
 // Clean the reader's buffer to and make it ready for the next next_line() call.
 // Moves finished records (SKIP_DONE flag set) at the end of the buffer and put
 // the rest to the beggining. Then shorten the buffer so that the last element
@@ -1687,133 +1708,124 @@ void bcf_sr_add_split_record(args_t *args, int reader_idx, bcf1_t* record, int a
 // end; next, the first record of the buffer must be one of those already
 // printed, as it will be discarded by next_line().
 //
+// Better explanation: For readers which participated in the last merge, reorganize buffer so that:
+// a. Records [1:num_not_done] contain records with (rec->pos == pos) which are !SKIP_DONE
+// b. Records [1+num_not_done:num_not_done+num_splits] contain records where the intervals are split
+// c. Records [1+num_not_done+num_splits:num_diff] contain records with a different position
+// d. Record [1+num_not_done+num_splits+num_diff:last_valid_record_idx]: contain records which were already processed
+// Since buffer elements are fully allocated bcf1_t*, make sure you do not lose any of them (else memory leaks will occur)
+// Finally update nbuffer and last_valid_record_idx
 void shake_buffer(maux_t *maux, int ir, int pos)
 {
     bcf_sr_t *reader = &maux->files->readers[ir];
+    bcf_hdr_t* hdr = reader->header;
     maux1_t *m = maux->d[ir];
 
-    if ( !reader->buffer ) return;
+    //was not involved in merge - don't bother to check further
+    if ( !reader->buffer  || reader->buffer[0]->pos != pos) return;
 
     int i;
     // FILE *fp = stdout;
     // fprintf(fp,"<going to shake> nbuf=%d\t", reader->nbuffer); for (i=0; i<reader->nbuffer; i++) fprintf(fp," %d", skip[i]); fprintf(fp,"\n");
     // debug_buffer(fp,reader);
     // fprintf(fp,"--\n");
-
-    int a = 1, b = reader->nbuffer;
-    //Either nbuffer entry has different pos or this is the last set of records
-    ASSERT(reader->buffer[b]->pos != pos || reader->eof);
-    if ( reader->buffer[b]->pos != pos ) b--;   // move the last line separately afterwards
-
-    //flag representing that not a single record with ->pos == pos is remaining in the buffer with status (!DONE)
-    int no_same_pos_records_remaining = 1;
-    for(i=0;i<=reader->nbuffer;++i)
-        if(reader->buffer[i]->pos == pos && !(m[i].skip&SKIP_DONE))
-        {
-            no_same_pos_records_remaining = 0;
-            break;
-        }
-
-    while ( a<b )
+    bcf1_t** duplicate_buffer = (bcf1_t**)malloc((reader->last_valid_record_idx+1)*sizeof(bcf1_t*));
+    int* duplicate_skip = (int*)malloc((reader->last_valid_record_idx+1)*sizeof(int));
+    int last_same_pos_idx = (reader->buffer[reader->nbuffer]->pos == pos) ? reader->nbuffer
+        : reader->nbuffer-1;
+    int num_not_dones = 0;
+    int num_splits = 0;
+    for(i=0;i<=last_same_pos_idx;++i)
     {
-        if ( !(m[a].skip&SKIP_DONE) ) { a++; continue; }
-        if ( m[b].skip&SKIP_DONE ) { b--; continue; }
-        SWAP(bcf1_t*, reader->buffer[a], reader->buffer[b]);
-        SWAP(maux1_t, m[a], m[b]);
-        a++;
-        b--;
+        duplicate_buffer[i] = reader->buffer[i];
+        duplicate_skip[i] = m[i].skip;
+        if(!(m[i].skip & SKIP_DONE))
+            ++num_not_dones;
+        else
+            if(reader->buffer[i]->m_is_split_record)
+                ++num_splits;
     }
-
-    // position $a to the after the first unfinished record
-    while ( a<=reader->nbuffer && !(m[a].skip&SKIP_DONE) ) a++;
-
-    if ( a<reader->nbuffer )
+    int num_dones = (last_same_pos_idx+1)-(num_splits+num_not_dones);
+    int num_diff_pos = (reader->last_valid_record_idx - last_same_pos_idx);
+    for(;i<=reader->last_valid_record_idx;++i)
     {
-        //Either nbuffer entry has different pos or this is the last set of records
-        ASSERT(reader->buffer[reader->nbuffer]->pos != pos || reader->eof);
-        // there is a gap between the unfinished lines at the beggining and the
-        // last line. The last line must be brought forward to fill the gap
-        // For gVCFs, nbuffer and last_valid_record_idx are different
-        //      Move all records from [nbuffer:last_valid_record_idx] up
-        if ( reader->buffer[reader->nbuffer]->pos != pos )
+        duplicate_skip[i] = m[i].skip;
+        duplicate_buffer[i] = reader->buffer[i];
+    }
+    //will start writing at buffer[1] and not 0
+    int not_done_idx = 1;
+    int splits_idx = not_done_idx + num_not_dones;
+    int diff_pos_idx = splits_idx + num_splits;
+    int dones_idx = diff_pos_idx + num_diff_pos;
+    int final_idx = dones_idx + num_dones - 1;
+    ASSERT(final_idx == reader->last_valid_record_idx+1);
+    if (final_idx >= maux->nbuf[ir] ) 
+    {
+        int tmp = reader->last_valid_record_idx;
+        reader->last_valid_record_idx = final_idx;
+        maux_expand1(maux, ir);
+        reader->last_valid_record_idx = tmp;
+        m = maux->d[ir];
+    }
+    ASSERT(reader->mbuffer > final_idx);
+    //Final location will be overwritten - move to idx 0
+    reader->buffer[0] = reader->buffer[final_idx];
+    for(i=0;i<=last_same_pos_idx;++i)
+    {
+        bcf1_t* curr_record = duplicate_buffer[i];
+        if(!(duplicate_skip[i]&SKIP_DONE))
         {
-            int diff = reader->last_valid_record_idx - reader->nbuffer;
-            int iter = 0;
-            for(iter=0;iter<=diff;++iter)
-            {
-                SWAP(bcf1_t*, reader->buffer[a+iter], reader->buffer[reader->nbuffer+iter]);
-                SWAP(maux1_t, m[a+iter], m[reader->nbuffer+iter]);
-            }
-            reader->nbuffer = a;
-            reader->last_valid_record_idx = a + diff;
+            m[not_done_idx].skip = duplicate_skip[i];
+            reader->buffer[not_done_idx++] = curr_record;
         }
         else
         {
-            //Part of last set of records in file, all with the same pos value
-            //Records that are !DONE have been moved up by the while(a<b) loop
-            //Point to the record before that
-            reader->nbuffer = a-1;
-            reader->last_valid_record_idx = a-1;
-        }
-    }
-
-    if ( !(m[0].skip&SKIP_DONE) && reader->buffer[0]->pos==pos )
-    {
-        // the first record is unfinished, replace it with an empty line
-        // from the end of the buffer or else next_line will remove it
-        if ( reader->last_valid_record_idx + 1 >= maux->nbuf[ir] ) 
-        {
-            reader->last_valid_record_idx++;
-            maux_expand1(maux, ir);
-            reader->last_valid_record_idx--;
-            m = maux->d[ir];
-        }
-        if ( reader->last_valid_record_idx+1 >= reader->mbuffer ) 
-            error("Uh, did not expect this: %d vs %d\n", reader->last_valid_record_idx,reader->mbuffer);
-
-        if ( reader->buffer[reader->nbuffer]->pos!=pos )
-        {
-            // 4way swap
-            bcf1_t *tmp = reader->buffer[0];
-            //Copy a 'dummy'/invalid entry to idx 0
-            //Required to ensure that bcf1_t* is freed correctly later
-            reader->buffer[0] = reader->buffer[reader->last_valid_record_idx+1];
-            //shift down all entries from [nbuffer:last_valid_record_idx] 
-            //For gVCFs, last_valid_record_idx and nbuffer are different
-            int j = 0;
-            for(j=reader->last_valid_record_idx;j>=reader->nbuffer;--j)
+            if(curr_record->m_is_split_record)
             {
-                reader->buffer[j+1] = reader->buffer[j];
-                m[j+1].skip = SKIP_DIFF;
+                //new start pos is 1 greater than current END
+                curr_record->pos = bcf_get_end_point(curr_record) + 1;
+                bcf_set_end_point(curr_record, bcf_get_split_end_point(curr_record));
+                //set end point in INFO field
+                bcf_set_end_point_in_info(hdr, curr_record);
+                //set REF base
+                //REF intervals have only 2 alleles - REF base and NON_REF tag
+                ASSERT(curr_record->n_allele == 2);
+                //the REF allele in a REF interval is a single base
+                ASSERT(strlen(curr_record->d.allele[0]) == 1);
+                curr_record->d.allele[0][0] = bcf_get_split_ref_base(curr_record);
+                curr_record->d.allele[0][1] = '\0';
+                curr_record->d.shared_dirty |= BCF1_DIRTY_ALS;
+                //FIXME: no need to call bcf_update_alleles as the REF length is unchanged
+                //bcf_update_alleles unnecessarily invokes free and kputc adding an overhead
+                /*bcf_update_alleles(hdr, curr_record, (const char**)curr_record->d.allele,*/
+                /*curr_record->n_allele);*/
+                curr_record->m_is_split_record = 0;
+                m[splits_idx].skip = 0; //should retry this record again
+                reader->buffer[splits_idx++] = curr_record;
             }
-            //Put 0 into the place where nbuffer was
-            reader->buffer[reader->nbuffer] = tmp;
-            m[reader->nbuffer].skip   = m[0].skip;
-            //maintain invariant : reader->nbuffer should point to BCF record with diff pos, pushed down
-            ++(reader->nbuffer);
-            //last valid entry was pushed down
-            ++(reader->last_valid_record_idx);
-        }
-        else
-        {
-            //Either nbuffer entry has different pos or this is the last set of records
-            ASSERT(reader->eof);
-            //No extra split records have been added
-            ASSERT(reader->nbuffer == reader->last_valid_record_idx);
-            //FIXME: This seems wrong - nbuffer is not updated, and entry 0 is moved beyond nbuffer
-            SWAP(bcf1_t*, reader->buffer[0], reader->buffer[reader->nbuffer+1]);
-            SWAP(maux1_t, m[0], m[reader->nbuffer+1]);
-            ASSERT(0);
+            else
+            {
+                m[dones_idx].skip = duplicate_skip[i]; 
+                reader->buffer[dones_idx++] = curr_record;
+            }
         }
     }
-
-    int new_split_records_added = (reader->nbuffer != reader->last_valid_record_idx);
-    //If new split records are added in this round to this reader and all the current records 
-    //with ->pos == pos are processed (SKIP_DONE), then new split records should be merged in the next
-    //round. To do this correctly, set nbuffer to last_valid_record_idx. 
-    if(no_same_pos_records_remaining && new_split_records_added)
-        reader->nbuffer = reader->last_valid_record_idx;
-
+    for(;i<=reader->last_valid_record_idx;++i)
+    {
+        m[diff_pos_idx].skip = duplicate_skip[i];
+        reader->buffer[diff_pos_idx++] = duplicate_buffer[i];
+    }
+    reader->last_valid_record_idx = diff_pos_idx - 1; //ignore the dones
+    if(num_not_dones > 0)
+        if(num_splits + num_diff_pos == 0)      //no other valid !DONE records, point nbuffer to last !DONE record
+            reader->nbuffer = not_done_idx - 1;
+        else
+            reader->nbuffer = not_done_idx;     //point to first record with diff pos
+    else
+        if(num_diff_pos == 0)                   //only splits exist, point to last split rec
+            reader->nbuffer = splits_idx - 1;
+        else
+            reader->nbuffer = splits_idx;       //others apart from splits exist, point to first rec with diff pos
     // debug_buffer(fp,reader);
     // fprintf(fp,"<shaken>\t"); for (i=0; i<reader->nbuffer; i++) fprintf(fp," %d", skip[i]);
     // fprintf(fp,"\n\n");
@@ -1821,15 +1833,8 @@ void shake_buffer(maux_t *maux, int ir, int pos)
     // set position of finished buffer[0] line to -1, otherwise swapping may
     // bring it back after next_line()
     reader->buffer[0]->pos = -1;
-
-    // trim the buffer, remove finished lines from the end
-    // TODO: Is this loop even executed? the if(a<reader->nbuffer) should have handled it
-    i = reader->nbuffer;
-    while ( i>=1 && m[i--].skip&SKIP_DONE )
-    {
-        ASSERT(0);
-        reader->nbuffer--;
-    }
+    free(duplicate_buffer);
+    free(duplicate_skip);
 }
 
 void debug_maux(args_t *args, int pos, int var_type)
@@ -2041,46 +2046,32 @@ int find_end_position(args_t* args, int* chrom_idx, char** ref_id, char* ref_bas
     //File idx not involved in current round of merge whose start pos is min
     int min_start_file_idx = -1;
     int has_line_file_idx = -1;
-    int* tmp_end_ptr = (int*)malloc(sizeof(int));
     int curr_end_point = 0;
-    int length = 0;
     for(i=0;i<files->nreaders;++i)
     {
         bcf_sr_t* curr_reader = &(files->readers[i]);
-        bcf_hdr_t* curr_header = curr_reader->header;
         if(bcf_sr_has_line(files, i))
         {
             int curr_pos = curr_reader->buffer[0]->pos;
+            //same pos check is necessary because of weird nature of nbuffer
+            //for EOF records, buffer[nbuffer] record has same pos as others
+            //in other cases, buffer[nbuffer] record has different pos as others
+            int last_same_pos_idx = (curr_reader->buffer[curr_reader->nbuffer]->pos == curr_pos) ? curr_reader->nbuffer
+                : curr_reader->nbuffer - 1;
             has_line_file_idx = i;
             //Multiple VCF records could have same position in a given file
-            for(j=0;j<=curr_reader->nbuffer;++j)
+            for(j=0;j<=last_same_pos_idx;++j)
             {
                 bcf1_t* curr_record = curr_reader->buffer[j];
-                ASSERT(curr_record && curr_record->pos >= 0);
-                //same pos check is necessary because of weird nature of nbuffer
-                //for EOF records, buffer[nbuffer] record has same pos as others
-                //in other cases, buffer[nbuffer] record has different pos as others
-                if(curr_record->pos == curr_pos)
+                ASSERT(curr_record && curr_record->pos >= 0 && curr_record->pos == curr_pos);
+                curr_end_point = bcf_get_end_point(curr_record);
+                ASSERT(curr_end_point >= 0);
+                if(end_point > curr_end_point)
                 {
-                    //TODO: never search for strings while merging records, instead pre-compute and store idx somewhere
-                    //either not present or present, no type errors. if found, END should be scalar
-                    int status = bcf_get_info_int32(curr_header,curr_record,"END",&tmp_end_ptr,&length);
-                    ASSERT(status == -3 || (status >= 0 && length == 1)); 
-                    if(status < 0)
-                        curr_end_point = curr_record->pos;   //single position, end point same as position
-                    else
-                    {
-                        //TODO: is this true for BCFs
-                        //why the -1? when VCFs are parsed, pos field begins from 0, however, END field is not modified similarly
-                        curr_end_point = (*tmp_end_ptr) - 1;
-                    }
-                    if(end_point > curr_end_point)
-                    {
-                        end_point = curr_end_point;
-                        min_start_file_idx = -1;
-                    }
-                    max_end_point = (curr_end_point > max_end_point) ? curr_end_point : max_end_point;
+                    end_point = curr_end_point;
+                    min_start_file_idx = -1;
                 }
+                max_end_point = (curr_end_point > max_end_point) ? curr_end_point : max_end_point;
             }
         }
         else    //does not have the line, meaning min position record begins at greater start position
@@ -2099,7 +2090,6 @@ int find_end_position(args_t* args, int* chrom_idx, char** ref_id, char* ref_bas
         }
     }
     ASSERT(end_point != INT32_MAX);
-    free(tmp_end_ptr);
     //Determine base at end_point+1, i.e., the start of new interval that is created
     //If the start of new interval is the start pos of one of the records in the buffer,
     //obtain reference base etc from that record
@@ -2110,14 +2100,16 @@ int find_end_position(args_t* args, int* chrom_idx, char** ref_id, char* ref_bas
         ASSERT(files->readers[min_start_file_idx].nbuffer);
         //Guaranteed to have have buffer idx 1 - obtain reference allele
         bcf1_t* rec = files->readers[min_start_file_idx].buffer[1];
-        bcf_unpack(rec, BCF_UN_STR);
         //REF + 1 variant
         ASSERT(rec->n_allele >= 2);
+        //FIXME: get chromosome id and ref_id for split interval
+#if 0
         //Chromosome id
         (*chrom_idx) = rec->rid;
         //ID field
         (*ref_id) = strdup(rec->d.id);
         ASSERT(*ref_id);
+#endif
         //First base of reference allele - REF
         (*ref_base) = rec->d.allele[0][0];
     }
@@ -2130,10 +2122,13 @@ int find_end_position(args_t* args, int* chrom_idx, char** ref_id, char* ref_bas
             bcf_sr_t* reader = &(files->readers[has_line_file_idx]);
             bcf1_t* rec = reader->buffer[0];
             int rid = rec->rid;
+            //FIXME: get chromosome id and ref_id for split interval
+#if 0
             //Chromosome id
             (*chrom_idx) = rid;
             //ID field - set to empty (NULL) since we don't know the ID at new interval's position
             (*ref_id) = 0;
+#endif
             //First base of reference allele - REF, obtain from reference file
             const char* contig_name = reader->header->id[BCF_DT_CTG][rid].key;
             (*ref_base) = get_reference_base_at_position(args, contig_name, end_point+1);
@@ -2142,27 +2137,25 @@ int find_end_position(args_t* args, int* chrom_idx, char** ref_id, char* ref_bas
     return end_point;
 }
 
-bcf1_t* create_split_record(bcf_hdr_t* curr_header, bcf1_t* curr_record, int start_pos,
+void store_split_info(bcf_hdr_t* curr_header, bcf1_t* curr_record, int new_end_point,
         int chrom_idx, const char* ref_id, char ref_base)
 {
-    bcf1_t* duplicate = bcf_dup(curr_record);
-    //set start position of duplicate record
-    duplicate->pos = start_pos;
-    //FIXME: Horrible, horrible HACK
-    duplicate->is_split_record = 1;
-    //update ID
-    bcf_unpack(duplicate, BCF_UN_STR);
-    bcf_update_id(curr_header, duplicate, ref_id);
+    curr_record->m_is_split_record = 1;
+    //old end point will be end point of split interval
+    bcf_set_split_end_point(curr_record, bcf_get_end_point(curr_record));
+    //Set REF base at start of new split interval
+    bcf_set_split_ref_base(curr_record, ref_base);
+    //update end point
+    bcf_set_end_point(curr_record, new_end_point);
+    //FIXME: update ref_id, chrom_idx
+#if 0
+    bcf_set_split_reference_base(curr_record, ref_base);
     //Update chrom idx
     duplicate->rid = chrom_idx;
     //Update ref_base
-    //Guaranteed to be of size 2 at least
-    duplicate->d.allele[0][0] = ref_base;
-    duplicate->d.allele[0][1] = '\0';
-    //According to update_alleles, can re-use same memory
-    bcf_update_alleles(curr_header, duplicate, (const char**)duplicate->d.allele,
-            duplicate->n_allele);
+    
     return duplicate;
+#endif
 }
 
 //Say we are merging 3 samples S1, S2, S3
@@ -2178,12 +2171,8 @@ void align_to_end(args_t* args, int new_end_point, int chrom_idx, const char* re
 {
     int i = 0;
     int j = 0;
-    int* info_end_point = (int*)malloc(sizeof(int));
-    //why the +1? when VCFs are parsed, pos field begins from 0, however END field is not handled similarly, have to do this explicity
-    info_end_point[0] = new_end_point + 1;    
-    int* end_point_ptr = (int*)malloc(sizeof(int));
-    int length = 0;
     bcf_srs_t* files = args->files;
+    int end_point = -1;
     for(i=0;i<files->nreaders;++i)
     {
         bcf_sr_t* curr_reader = &(files->readers[i]);
@@ -2192,48 +2181,27 @@ void align_to_end(args_t* args, int new_end_point, int chrom_idx, const char* re
         if(bcf_sr_has_line(files, i))
         {
             int curr_pos = curr_reader->buffer[0]->pos;
-            //Last set of records from the reader
-            int is_last_record_set = (curr_reader->buffer[curr_reader->nbuffer]->pos == curr_pos);
+            //same pos check is necessary because of weird nature of nbuffer
+            //for EOF records, buffer[nbuffer] record has same pos as others
+            //in other cases, buffer[nbuffer] record has different pos as others
+            int last_same_pos_idx = (curr_reader->buffer[curr_reader->nbuffer]->pos == curr_pos) ? curr_reader->nbuffer
+                : curr_reader->nbuffer - 1;
             int num_split_records_added = 0;
-            for(j=0;j<=curr_reader->nbuffer;++j)
+            for(j=0;j<=last_same_pos_idx;++j)
             {
                 bcf1_t* curr_record = curr_reader->buffer[j];
                 ASSERT(curr_record && curr_record->pos >= 0);
-                //same pos check is necessary because of weird nature of nbuffer
-                //for EOF records, buffer[nbuffer] record has same pos as others
-                //in other cases, buffer[nbuffer] record has different pos as others
-                if(curr_record->pos == curr_pos)
+                end_point = bcf_get_end_point(curr_record);
+                ASSERT(end_point >= new_end_point);
+                if(end_point > new_end_point)      //need to split record
                 {
-                    //TODO: never search for strings while merging records, instead pre-compute and store idx somewhere
-                    int status = bcf_get_info_int32(curr_header,curr_record,"END",&end_point_ptr, &length);
-                    //either not present or present, no type errors. if found, END should be scalar
-                    ASSERT(status == -3 || (status >= 0 && length == 1)); 
-                    int end_point = 0;
-                    if(status < 0)
-                        end_point = curr_record->pos;   //single position, end point same as position
-                    else
-                        end_point = (*end_point_ptr) - 1;//why the -1? when VCFs are parsed, pos field begins from 0
-                    ASSERT(end_point >= new_end_point);
-                    if(end_point > new_end_point)      //need to split record
-                    {
-                        //create new record identical to curr_record except that it starts at new_end_point+1
-                        bcf1_t* duplicate = create_split_record(curr_header, curr_record, new_end_point+1, chrom_idx, ref_id, ref_base);
-                        //set end position for current record
-                        bcf_update_info_int32(curr_header, curr_record, "END", info_end_point, 1);
-                        //add to reader->buffer
-                        bcf_sr_add_split_record(args, i, duplicate, is_last_record_set);
-                        ++num_split_records_added;
-                    }
+                    //store information about the split
+                    store_split_info(curr_header, curr_record, new_end_point, chrom_idx, ref_id, ref_base);
+                    ++num_split_records_added;
                 }
             }
-            //Update the value of nbuffer
-            if(num_split_records_added > 0)
-                if(is_last_record_set)
-                    ++(curr_reader->nbuffer);
         }
     }
-    free(info_end_point);
-    free(end_point_ptr);
 }
 
 // Determine which line should be merged from which reader: go through all
@@ -2275,10 +2243,34 @@ void merge_buffer(args_t *args)
         int chrom_idx = -1;
         char* ref_id = 0;
         char ref_base = 0;
+        //Do unpack and don't bother to check later
+        for (i=0; i<files->nreaders; i++)
+            if ( bcf_sr_has_line(files,i) )
+            {
+                int j = 0;
+                int last_same_pos_idx = (files->readers[i].buffer[0]->pos == 
+                        files->readers[i].buffer[files->readers[i].nbuffer]->pos)
+                    ? files->readers[i].nbuffer : files->readers[i].nbuffer-1;
+                for(j=0;j<=last_same_pos_idx;++j)
+                {
+                    bcf_unpack(files->readers[i].buffer[j], BCF_UN_INFO);
+                    bcf_set_end_point_from_info(files->readers[i].header, files->readers[i].buffer[j]);
+                }
+            }
         end_point = find_end_position(args, &chrom_idx, &ref_id, &ref_base);
         align_to_end(args, end_point, chrom_idx, ref_id, ref_base);
         if(ref_id)
             free(ref_id);
+        for (i=0; i<files->nreaders; i++)
+            if ( bcf_sr_has_line(files,i) )
+            {
+                int j = 0;
+                int last_same_pos_idx = (files->readers[i].buffer[0]->pos == 
+                        files->readers[i].buffer[files->readers[i].nbuffer]->pos)
+                    ? files->readers[i].nbuffer : files->readers[i].nbuffer-1;
+                for(j=0;j<=last_same_pos_idx;++j)
+                    bcf_set_end_point_in_info(files->readers[i].header, files->readers[i].buffer[j]);
+            }
     }
 
     // set the current position
@@ -2356,7 +2348,7 @@ void merge_buffer(args_t *args)
             }
 
             // normalize alleles
-            maux->als = merge_alleles(line->d.allele, line->n_allele, maux->d[i][j].map, maux->als, &maux->nals, &maux->mals, line->is_split_record);
+            maux->als = merge_alleles(line->d.allele, line->n_allele, maux->d[i][j].map, maux->als, &maux->nals, &maux->mals, line->m_is_split_record);
             if ( !maux->als ) error("Failed to merge alleles at %s:%d\n",bcf_seqname(args->out_hdr,line),line->pos+1);
             hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
             for (k=1; k<line->n_allele; k++)
@@ -2438,7 +2430,10 @@ void merge_buffer(args_t *args)
                 nmask++;
             }
         }
-        if ( !nmask ) break;    // done, no more lines suitable for merging found
+        if ( !nmask ) break;    // done, no more lines suitable for merging found 
+#ifdef COLLECT_STATS
+        update_stat(args, NUM_ACTIVE_SAMPLES_PER_LINE, nmask);
+#endif
         merge_line(args);       // merge and output the line
         maux->cnt[icnt] = -1;   // do not pick this allele again, mark it as finished
     }
@@ -2536,7 +2531,7 @@ void preprocess_header(bcf_hdr_t* src_hdr, int file_idx)
             if(is_info && action_type == MERGE_MOVE_TO_FORMAT)
             {
                 //Create a copy of hrec as we will remove that hrec from the header and add new hrec
-                bcf_hrec_t* orig_hrec = bcf_hdr_id2hrec_fixed(hdr, BCF_DT_ID, BCF_HL_INFO, i);
+                bcf_hrec_t* orig_hrec = bcf_hdr_id2hrec(hdr, BCF_DT_ID, BCF_HL_INFO, i);
                 ASSERT(orig_hrec);
                 bcf_hrec_t* tmp = bcf_hrec_dup(orig_hrec);
                 //change type to FORMAT
@@ -2870,7 +2865,8 @@ enum ArgsIdxEnum
 {
   ARGS_IDX_MERGE_CONFIG_FILE=1000,
   ARGS_IDX_REFERENCE_FILE,
-  ARGS_IDX_INPUT_GVCFS
+  ARGS_IDX_INPUT_GVCFS,
+  ARGS_IDX_TAG
 };
 
 int main_vcfmerge(int argc, char *argv[])
@@ -2907,6 +2903,7 @@ int main_vcfmerge(int argc, char *argv[])
         {"merge-config",1,0,ARGS_IDX_MERGE_CONFIG_FILE},
         {"reference",1,0,ARGS_IDX_REFERENCE_FILE},
         {"gvcf",0,0,ARGS_IDX_INPUT_GVCFS},
+        {"tag",1,0,ARGS_IDX_TAG},
         {0,0,0,0}
     };
     while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:l:",loptions,NULL)) >= 0) {
@@ -2943,6 +2940,7 @@ int main_vcfmerge(int argc, char *argv[])
             case ARGS_IDX_MERGE_CONFIG_FILE: parse_merge_config(optarg); break;
             case ARGS_IDX_REFERENCE_FILE: initialize_reference(args, optarg); break;
             case ARGS_IDX_INPUT_GVCFS: g_is_input_gvcf = 1; break;
+            case ARGS_IDX_TAG:  args->m_tag = strdup(optarg); break;
             case 'h': 
             case '?': usage();
             default: error("Unknown argument: %s\n", optarg);
@@ -2972,6 +2970,12 @@ int main_vcfmerge(int argc, char *argv[])
         for (i=0; i<nfiles; i++) free(files[i]);
         free(files);
     }
+#ifdef COLLECT_STATS
+    memset(args->stat_array, 0, LAST_STAT_IDX*sizeof(stat_struct));
+    args->stat_array[NUM_ACTIVE_SAMPLES_PER_LINE].m_histogram = 
+        (uint64*)calloc(args->files->nreaders+1, sizeof(uint64)); //0 to nreaders
+    args->stat_array[NUM_ACTIVE_SAMPLES_PER_LINE].m_histogram_size = args->files->nreaders+1;
+#endif
     merge_vcf(args);
     bcf_sr_destroy(args->files);
     if(g_preprocess_vcfs)       //destroy modified headers
@@ -2982,6 +2986,15 @@ int main_vcfmerge(int argc, char *argv[])
     }
     destroy_merge_config();
     destroy_reference(args);
+#ifdef COLLECT_STATS
+    print_stats(args);
+    int i = 0;
+    for(i=0;i<LAST_STAT_IDX;++i)
+        if(args->stat_array[i].m_histogram)
+            free(args->stat_array[i].m_histogram);
+#endif
+    if(args->m_tag)
+        free(args->m_tag);
     free(args);
 #ifdef DEBUG
     fclose(g_debug_fptr);

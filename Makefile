@@ -44,10 +44,15 @@ else
     CFLAGS = -O3
 endif
 
+ifdef COLLECT_STATS
+    CFLAGS += -DCOLLECT_STATS
+endif
+
 ifdef PROFILE
     GPERFTOOLSDIR=/home/karthikg/softwares/gperftools-2.2/install/
-    CFLAGS += -DPROFILE -I$(GPERFTOOLSDIR)/include	#-pg
+    CFLAGS += --no-inline -DPROFILE -I$(GPERFTOOLSDIR)/include
     LDLIBS += -Wl,-Bstatic -L$(GPERFTOOLSDIR)/lib -lprofiler -Wl,-Bdynamic  -lunwind -lstdc++
+    #CFLAGS += -pg
 endif
 CFLAGS+=	-Wall -Wc++-compat
 DFLAGS=
