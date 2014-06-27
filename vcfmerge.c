@@ -48,6 +48,7 @@ typedef khash_t(strdict) strdict_t;
 #define IS_VL_A(hdr,id) (bcf_hdr_id2length(hdr,BCF_HL_FMT,id) == BCF_VL_A)
 #define IS_VL_R(hdr,id) (bcf_hdr_id2length(hdr,BCF_HL_FMT,id) == BCF_VL_R)
 
+#define USE_ID_MAP 1
 // For merging INFO Number=A,G,R tags
 typedef struct
 {
@@ -111,9 +112,10 @@ maux_t;
 enum StatEnum
 {
     NUM_ACTIVE_SAMPLES_PER_LINE=0,
+    NUM_FAST_SHAKE_BUFFER,
     LAST_STAT_IDX
 };
-char* StatNames[] = { "num_samples_per_line", "NULL" };
+char* StatNames[] = { "num_samples_per_line", "num_fast_shake_buffer", "NULL" };
 typedef unsigned long long uint64;
 typedef struct
 {
@@ -124,6 +126,21 @@ typedef struct
     uint64 m_count;
 }stat_struct;
 #endif
+
+typedef struct
+{
+    int* m_id_2_merged_id;
+    int m_num_ids;
+}reader_idmap;
+
+typedef struct
+{
+    reader_idmap* m_readers_map;
+    int** m_merged_id_2_reader_idmap; //2D map [nreaders][num_output_ids]
+    int m_num_merged_ids;
+    //map from id in merged hdr to index in merged bcf1_t* out
+    int* m_merged_id_2_merged_idx; 
+}idmap;
 
 typedef struct
 {
@@ -150,6 +167,7 @@ typedef struct
 #ifdef COLLECT_STATS
     stat_struct stat_array[LAST_STAT_IDX];
 #endif
+    idmap m_idmap;
     char **argv;
     int argc;
 }
@@ -220,6 +238,22 @@ int get_merge_action(const char* key_string, int is_info, int is_format)
     }
 
 #ifdef COLLECT_STATS
+void initialize_stats(args_t* args)
+{
+    memset(args->stat_array, 0, LAST_STAT_IDX*sizeof(stat_struct));
+    args->stat_array[NUM_ACTIVE_SAMPLES_PER_LINE].m_histogram = 
+        (uint64*)calloc(args->files->nreaders+1, sizeof(uint64)); //0 to nreaders
+    args->stat_array[NUM_ACTIVE_SAMPLES_PER_LINE].m_histogram_size = args->files->nreaders+1;
+}
+
+void destroy_stats(args_t* args)
+{
+    int i = 0;
+    for(i=0;i<LAST_STAT_IDX;++i)
+        if(args->stat_array[i].m_histogram)
+            free(args->stat_array[i].m_histogram);
+}
+
 void update_stat(args_t* args, int stat_idx, int value)
 {
     ASSERT(stat_idx >= 0 && stat_idx < LAST_STAT_IDX);
@@ -1173,11 +1207,13 @@ void merge_info(args_t *args, bcf1_t *out)
     bcf_srs_t *files = args->files;
     bcf_hdr_t *out_hdr = args->out_hdr;
 
-    int i, j, ret;
+    int i, j;
+#ifndef USE_ID_MAP
+    int ret;
     khiter_t kitr;
     strdict_t *tmph = args->tmph;
     kh_clear(strdict, tmph);
-
+#endif
     maux_t *ma = args->maux;
     ma->nAGR_info = 0;
     out->n_info   = 0;
@@ -1188,6 +1224,9 @@ void merge_info(args_t *args, bcf1_t *out)
         bcf_sr_t *reader = &files->readers[i];
         bcf1_t *line = reader->buffer[0];
         bcf_hdr_t *hdr = reader->processed_header;
+#ifdef USE_ID_MAP
+        reader_idmap* curr_map = &(args->m_idmap.m_readers_map[i]);
+#endif
         for (j=0; j<line->n_info; j++) 
         {
             bcf_info_t *inf = &line->d.info[j];
@@ -1196,11 +1235,22 @@ void merge_info(args_t *args, bcf1_t *out)
 
             const char *key = hdr->id[BCF_DT_ID][inf->key].key;
             if ( !strcmp("AC",key) || !strcmp("AN",key) ) continue;  // AC and AN are done in merge_format() after genotypes are done
-
+#ifdef USE_ID_MAP
+            ASSERT(inf->key < curr_map->m_num_ids);
+            int id = curr_map->m_id_2_merged_id[inf->key];
+            ASSERT(id >= 0 && id < out_hdr->n[BCF_DT_ID] && id < args->m_idmap.m_num_merged_ids);
+            int* merged_idx_ptr = &(args->m_idmap.m_merged_id_2_merged_idx[id]);
+#ifdef DEBUG
+            ASSERT(bcf_hdr_idinfo_exists(out_hdr, BCF_HL_INFO, id));    //should be INFO field 
+            const char* out_key = bcf_hdr_int2id(out_hdr, BCF_DT_ID, id);
+            ASSERT(out_key && strcmp(out_key, key) == 0);       //same as this key
+#endif
+#else  //USE_ID_MAP
             int id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, key);
             if ( id==-1 ) error("Error: The INFO field is not defined in the header: %s\n", key);
 
             kitr = kh_get(strdict, tmph, key);  // have we seen the tag in one of the readers?
+#endif //USE_ID_MAP
             int len = bcf_hdr_id2length(hdr,BCF_HL_INFO,inf->key);
             if ( args->nrules )
             {
@@ -1216,13 +1266,21 @@ void merge_info(args_t *args, bcf1_t *out)
             // and merge_AGR_info_tag to be made obsolete.
             if ( len==BCF_VL_A || len==BCF_VL_G || len==BCF_VL_R  ) // Number=R,G,A requires special treatment
             {
+#ifdef USE_ID_MAP
+                if(*merged_idx_ptr == -1)
+#else
                 if ( kitr == kh_end(tmph) )
+#endif
                 {
                     // first occurance in this reader, alloc arrays
                     ma->nAGR_info++;
                     hts_expand0(AGR_info_t,ma->nAGR_info,ma->mAGR_info,ma->AGR_info);
+#ifdef USE_ID_MAP
+                    *merged_idx_ptr = ma->nAGR_info - 1;
+#else
                     kitr = kh_put(strdict, tmph, key, &ret);
                     kh_val(tmph,kitr) = ma->nAGR_info - 1;
+#endif
                     ma->AGR_info[ma->nAGR_info-1].hdr_tag = key;
                     ma->AGR_info[ma->nAGR_info-1].type  = bcf_hdr_id2type(hdr,BCF_HL_INFO,inf->key);
                     ma->AGR_info[ma->nAGR_info-1].nbuf  = 0;    // size of the buffer
@@ -1233,14 +1291,25 @@ void merge_info(args_t *args, bcf1_t *out)
                         case BCF_VL_R: ma->AGR_info[ma->nAGR_info-1].nvals = ma->nout_als; break;
                     }
                 }
+#ifdef USE_ID_MAP
+                int idx = *merged_idx_ptr;
+#ifdef DEBUG
+                ASSERT(idx >= 0 && idx < ma->nAGR_info);
+                ASSERT(strcmp(ma->AGR_info[idx].hdr_tag, key) == 0);    //same as key
+#endif
+#else   //USE_ID_MAP
                 kitr = kh_get(strdict, tmph, key);
                 int idx = kh_val(tmph, kitr);
                 if ( idx<0 ) error("Error occurred while processing INFO tag \"%s\" at %s:%d\n", key,bcf_seqname(hdr,line),line->pos+1);
+#endif  //USE_ID_MAP
                 merge_AGR_info_tag(hdr, line,inf,len,&ma->d[i][0],&ma->AGR_info[idx]);
                 continue;
             }
-
+#ifdef USE_ID_MAP
+            if(*merged_idx_ptr == -1)
+#else
             if ( kitr == kh_end(tmph) )
+#endif
             {
                 hts_expand0(bcf_info_t,out->n_info+1,ma->minf,ma->inf);
                 ma->inf[out->n_info].key  = id;
@@ -1260,8 +1329,12 @@ void merge_info(args_t *args, bcf1_t *out)
                     bcf_info_set_id(out, &ma->inf[out->n_info], id, &args->tmps);
                 }
                 out->n_info++;
+#ifdef USE_ID_MAP
+                *merged_idx_ptr = (out->n_info - 1);
+#else
                 kitr = kh_put(strdict, tmph, key, &ret);
-                kh_val(tmph,kitr) = -(out->n_info-1);   // arbitrary negative value
+                kh_val(tmph,kitr) = -(out->n_info-1);   // arbitrary negative value TODO:WHY??
+#endif
             }
         }
     }
@@ -1606,7 +1679,9 @@ void merge_format(args_t *args, bcf1_t *out)
     bcf_srs_t *files = args->files;
     bcf_hdr_t *out_hdr = args->out_hdr;
     maux_t *ma = args->maux;
-    if ( !ma->nfmt_map )
+    //map from ith format entry of merged line to jth sample's corresponding bcf_fmt_t* entry 
+    //ma->fmt_map[i*nreaders+j] gives the bcf_fmt_t* entry for sample j 
+    if ( !ma->nfmt_map ) 
     {
         ma->nfmt_map = 2;
         ma->fmt_map  = (bcf_fmt_t**) calloc(ma->nfmt_map*files->nreaders, sizeof(bcf_fmt_t*));
@@ -1614,10 +1689,13 @@ void merge_format(args_t *args, bcf1_t *out)
     else
         memset(ma->fmt_map, 0, ma->nfmt_map*files->nreaders*sizeof(bcf_fmt_t**));
 
+#ifndef USE_ID_MAP
     khiter_t kitr;
     strdict_t *tmph = args->tmph;
     kh_clear(strdict, tmph);
-    int i, j, ret, has_GT = 0, max_ifmt = 0; // max fmt index
+    int ret = 0;
+#endif
+    int i, j, has_GT = 0, max_ifmt = 0; // max fmt index
 
     //Get all format fields and collect info about allele re-numbering for every sample
     for (i=0; i<files->nreaders; i++)
@@ -1626,23 +1704,38 @@ void merge_format(args_t *args, bcf1_t *out)
         bcf_sr_t *reader = &files->readers[i];
         bcf1_t *line = reader->buffer[0];
         bcf_hdr_t *hdr = reader->processed_header;
+#ifdef USE_ID_MAP
+        reader_idmap* curr_map = &(args->m_idmap.m_readers_map[i]);
+#endif
         for (j=0; j<line->n_fmt; j++) 
         {
             // Wat this tag already seen?
             bcf_fmt_t *fmt = &line->d.fmt[j];
             const char *key = hdr->id[BCF_DT_ID][fmt->id].key;
+#ifdef USE_ID_MAP
+            ASSERT(fmt->id < curr_map->m_num_ids);
+            int out_id = curr_map->m_id_2_merged_id[fmt->id];
+            ASSERT(out_id >= 0 && out_id < out_hdr->n[BCF_DT_ID] && out_id < args->m_idmap.m_num_merged_ids);
+            int* merged_idx_ptr = &(args->m_idmap.m_merged_id_2_merged_idx[out_id]);
+            int ifmt = *merged_idx_ptr;
+#ifdef DEBUG
+            ASSERT(bcf_hdr_idinfo_exists(out_hdr, BCF_HL_FMT, out_id));    //should be FORMAT field 
+            const char* out_key = bcf_hdr_int2id(out_hdr, BCF_DT_ID, out_id);
+            ASSERT(out_key && strcmp(out_key, key) == 0);       //same as this key
+#endif
+#else   //USE_ID_MAP
             kitr = kh_get(strdict, tmph, key);
-
-            int ifmt;
+            int ifmt = -1;
             if ( kitr != kh_end(tmph) )
                 ifmt = kh_value(tmph, kitr);    // seen
-            else
+#endif  //USE_ID_MAP
+            if(ifmt == -1)
             {
                 // new FORMAT tag
                 if ( key[0]=='G' && key[1]=='T' && key[2]==0 ) { has_GT = 1; ifmt = 0; }
                 else
                 {
-                    ifmt = ++max_ifmt;
+                    ifmt = ++max_ifmt;  //GT is fmt index 0
                     if ( max_ifmt >= ma->nfmt_map )
                     {
                         ma->fmt_map = (bcf_fmt_t**) realloc(ma->fmt_map, sizeof(bcf_fmt_t*)*(max_ifmt+1)*files->nreaders);
@@ -1650,8 +1743,12 @@ void merge_format(args_t *args, bcf1_t *out)
                         ma->nfmt_map = max_ifmt+1;
                     }
                 }
+#ifdef USE_ID_MAP
+                *merged_idx_ptr = ifmt;
+#else
                 kitr = kh_put(strdict, tmph, key, &ret);
                 kh_value(tmph, kitr) = ifmt;
+#endif
             }
             ma->fmt_map[ifmt*files->nreaders+i] = fmt;
         }
@@ -1688,6 +1785,10 @@ void merge_line(args_t *args)
 
     merge_chrom2qual(args, out);
     merge_filter(args, out);
+#ifdef USE_ID_MAP
+    //map from id in merged hdr to index in merged bcf1_t* out : initialize to -1
+    memset(args->m_idmap.m_merged_id_2_merged_idx, -1, args->m_idmap.m_num_merged_ids*sizeof(int));
+#endif
     merge_info(args, out);
     merge_format(args, out);
 
@@ -1715,7 +1816,11 @@ void debug_buffer(FILE *fp, bcf_sr_t *reader);
 // d. Record [1+num_not_done+num_splits+num_diff:last_valid_record_idx]: contain records which were already processed
 // Since buffer elements are fully allocated bcf1_t*, make sure you do not lose any of them (else memory leaks will occur)
 // Finally update nbuffer and last_valid_record_idx
+#ifdef COLLECT_STATS
+void shake_buffer(args_t* args, maux_t *maux, int ir, int pos)
+#else
 void shake_buffer(maux_t *maux, int ir, int pos)
+#endif
 {
     bcf_sr_t *reader = &maux->files->readers[ir];
     bcf_hdr_t* hdr = reader->header;
@@ -1724,7 +1829,61 @@ void shake_buffer(maux_t *maux, int ir, int pos)
     //was not involved in merge - don't bother to check further
     if ( !reader->buffer  || reader->buffer[0]->pos != pos) return;
 
-    int i;
+#define HANDLE_SPLIT_RECORD(hdr, curr_record)                                                           \
+    /*new start pos is 1 greater than current END*/                                                     \
+    curr_record->pos = bcf_get_end_point(curr_record) + 1;                                              \
+    bcf_set_end_point(curr_record, bcf_get_split_end_point(curr_record));                               \
+    /*set end point in INFO field*/                                                                     \
+    bcf_set_end_point_in_info(hdr, curr_record);                                                        \
+    /*set REF base*/                                                                                    \
+    /*REF intervals have only 2 alleles - REF base and NON_REF tag*/                                    \
+    ASSERT(curr_record->n_allele == 2);                                                                 \
+    /*the REF allele in a REF interval is a single base*/                                               \
+    ASSERT(strlen(curr_record->d.allele[0]) == 1);                                                      \
+    curr_record->d.allele[0][0] = bcf_get_split_ref_base(curr_record);                                  \
+    curr_record->d.allele[0][1] = '\0';                                                                 \
+    curr_record->d.shared_dirty |= BCF1_DIRTY_ALS;                                                      \
+    /*FIXME: no need to call bcf_update_alleles as the REF length is unchanged*/                        \
+    /*bcf_update_alleles unnecessarily invokes free and kputc adding an overhead*/                      \
+    /*bcf_update_alleles(hdr, curr_record, (const char**)curr_record->d.allele,*/                       \
+    /*curr_record->n_allele);*/                                                                         \
+    curr_record->m_is_split_record = 0;
+    
+    int i = 0;
+    //Most common case, 2 entries in buffer, 1 merged in the completed round, 1 next pos
+    //Common case code is as simple as possible for speed (I feel the need, the need for speed)
+    if(reader->nbuffer == 1 && reader->last_valid_record_idx == 1 && (reader->buffer[1]->pos != pos)
+            && (m[0].skip&SKIP_DONE))
+    {
+#ifdef COLLECT_STATS
+        update_stat(args, NUM_FAST_SHAKE_BUFFER, 1);
+#endif
+        bcf1_t* tmp = 0;
+        if(reader->buffer[0]->m_is_split_record)        //should re-schedule this interval
+        {
+            HANDLE_SPLIT_RECORD(hdr, reader->buffer[0]);
+            ASSERT(reader->mbuffer >= 3);
+            reader->last_valid_record_idx = reader->nbuffer = 2;
+            if (maux->nbuf[ir] < 3) 
+            {
+                maux_expand1(maux, ir);
+                m = maux->d[ir];
+            }
+            m[1].skip = 0;
+            m[2].skip = 0;
+            //shift down
+            tmp = reader->buffer[2];
+            reader->buffer[2] = reader->buffer[1];
+            reader->buffer[1] = reader->buffer[0];
+            reader->buffer[0] = tmp;
+        }
+        reader->buffer[0]->pos = -1;
+        return;
+    }
+    //Now handle the general case
+#ifdef COLLECT_STATS
+    update_stat(args, NUM_FAST_SHAKE_BUFFER, 0);
+#endif
     // FILE *fp = stdout;
     // fprintf(fp,"<going to shake> nbuf=%d\t", reader->nbuffer); for (i=0; i<reader->nbuffer; i++) fprintf(fp," %d", skip[i]); fprintf(fp,"\n");
     // debug_buffer(fp,reader);
@@ -1782,24 +1941,7 @@ void shake_buffer(maux_t *maux, int ir, int pos)
         {
             if(curr_record->m_is_split_record)
             {
-                //new start pos is 1 greater than current END
-                curr_record->pos = bcf_get_end_point(curr_record) + 1;
-                bcf_set_end_point(curr_record, bcf_get_split_end_point(curr_record));
-                //set end point in INFO field
-                bcf_set_end_point_in_info(hdr, curr_record);
-                //set REF base
-                //REF intervals have only 2 alleles - REF base and NON_REF tag
-                ASSERT(curr_record->n_allele == 2);
-                //the REF allele in a REF interval is a single base
-                ASSERT(strlen(curr_record->d.allele[0]) == 1);
-                curr_record->d.allele[0][0] = bcf_get_split_ref_base(curr_record);
-                curr_record->d.allele[0][1] = '\0';
-                curr_record->d.shared_dirty |= BCF1_DIRTY_ALS;
-                //FIXME: no need to call bcf_update_alleles as the REF length is unchanged
-                //bcf_update_alleles unnecessarily invokes free and kputc adding an overhead
-                /*bcf_update_alleles(hdr, curr_record, (const char**)curr_record->d.allele,*/
-                /*curr_record->n_allele);*/
-                curr_record->m_is_split_record = 0;
+                HANDLE_SPLIT_RECORD(hdr, curr_record);         
                 m[splits_idx].skip = 0; //should retry this record again
                 reader->buffer[splits_idx++] = curr_record;
             }
@@ -2448,7 +2590,11 @@ void merge_buffer(args_t *args)
 
     // get the buffers ready for the next next_line() call
     for (i=0; i<files->nreaders; i++)
+#ifdef COLLECT_STATS
+        shake_buffer(args, maux, i, pos);
+#else
         shake_buffer(maux, i, pos);
+#endif
 }
 
 void bcf_hdr_append_version(bcf_hdr_t *hdr, int argc, char **argv, const char *cmd)
@@ -2591,6 +2737,66 @@ void preprocess_header(bcf_hdr_t* src_hdr, int file_idx)
 #endif
 }
 
+void setup_idmap(args_t* args)
+{
+    int i = 0;
+    int j = 0;
+    bcf_hdr_t* out_hdr = args->out_hdr;
+    //map from ids of file i to merged hdr ids
+    args->m_idmap.m_readers_map = (reader_idmap*)calloc(args->files->nreaders, sizeof(reader_idmap));
+    args->m_idmap.m_num_merged_ids = out_hdr->n[BCF_DT_ID];
+    //map from merged ids to ids of file i
+    args->m_idmap.m_merged_id_2_reader_idmap = (int**)malloc(args->files->nreaders*sizeof(int*));
+    //map from id in merged hdr to index in merged bcf1_t* out
+    args->m_idmap.m_merged_id_2_merged_idx = (int*)malloc(args->m_idmap.m_num_merged_ids*sizeof(int));
+    for(i=0;i<args->files->nreaders;++i)
+    {
+        //map from merged ids to ids of file i
+        args->m_idmap.m_merged_id_2_reader_idmap[i] = (int*)malloc(out_hdr->n[BCF_DT_ID]*sizeof(int));
+        //initialize to -1
+        memset(args->m_idmap.m_merged_id_2_reader_idmap[i], -1, out_hdr->n[BCF_DT_ID]*sizeof(int));
+        bcf_hdr_t* curr_hdr = args->files->readers[i].processed_header;
+        //map from ids of file i to merged hdr ids
+        reader_idmap* curr_map = &(args->m_idmap.m_readers_map[i]); 
+        curr_map->m_num_ids = curr_hdr->n[BCF_DT_ID];
+        curr_map->m_id_2_merged_id = (int*)malloc(curr_hdr->n[BCF_DT_ID]*sizeof(int));
+        for(j=0;j<curr_hdr->n[BCF_DT_ID];++j)
+        {
+            bcf_idpair_t* curr_id = &(curr_hdr->id[BCF_DT_ID][j]);
+            ASSERT(curr_id->val->id == j);
+            const char* key = curr_id->key;
+            int out_idx = bcf_hdr_id2int(out_hdr, BCF_DT_ID, key);
+#ifdef DEBUG
+            int col_type = bcf_hdr_idinfo_exists(curr_hdr,BCF_HL_FLT, j) ? BCF_HL_FLT : 
+                bcf_hdr_idinfo_exists(curr_hdr,BCF_HL_INFO, j) ? BCF_HL_INFO :
+                bcf_hdr_idinfo_exists(curr_hdr,BCF_HL_FMT, j) ? BCF_HL_FMT : -1;
+            ASSERT(col_type != -1);
+            ASSERT(out_idx >= 0 && out_idx < out_hdr->n[BCF_DT_ID]);
+            ASSERT(bcf_hdr_idinfo_exists(out_hdr, col_type, out_idx));  //same coltype as input
+#endif
+            curr_map->m_id_2_merged_id[j] = out_idx;
+            args->m_idmap.m_merged_id_2_reader_idmap[i][out_idx] = j;
+        }
+    }
+}
+
+void destroy_idmap(args_t* args)
+{
+    int i = 0;
+    if(args->m_idmap.m_readers_map)
+    {
+        for(i=0;i<args->files->nreaders;++i)
+        {
+            reader_idmap* ptr = &(args->m_idmap.m_readers_map[i]);
+            free(ptr->m_id_2_merged_id);
+            free(args->m_idmap.m_merged_id_2_reader_idmap[i]);
+        }
+        free(args->m_idmap.m_readers_map);
+        free(args->m_idmap.m_merged_id_2_reader_idmap);
+        free(args->m_idmap.m_merged_id_2_merged_idx);
+    }
+}
+
 void merge_vcf(args_t *args)
 {
     args->out_fh  = hts_open(args->output_fname, hts_bcf_wmode(args->output_type));
@@ -2628,6 +2834,7 @@ void merge_vcf(args_t *args)
         }
         bcf_hdr_append_version(args->out_hdr, args->argc, args->argv, "bcftools_merge");
         bcf_hdr_sync(args->out_hdr);
+        setup_idmap(args);
     }
     info_rules_init(args);
 
@@ -2971,12 +3178,11 @@ int main_vcfmerge(int argc, char *argv[])
         free(files);
     }
 #ifdef COLLECT_STATS
-    memset(args->stat_array, 0, LAST_STAT_IDX*sizeof(stat_struct));
-    args->stat_array[NUM_ACTIVE_SAMPLES_PER_LINE].m_histogram = 
-        (uint64*)calloc(args->files->nreaders+1, sizeof(uint64)); //0 to nreaders
-    args->stat_array[NUM_ACTIVE_SAMPLES_PER_LINE].m_histogram_size = args->files->nreaders+1;
+    initialize_stats(args);
 #endif
     merge_vcf(args);
+    //DESTRUCTION IS A FUNCTION!!!
+    destroy_idmap(args);
     bcf_sr_destroy(args->files);
     if(g_preprocess_vcfs)       //destroy modified headers
     {
@@ -2988,10 +3194,7 @@ int main_vcfmerge(int argc, char *argv[])
     destroy_reference(args);
 #ifdef COLLECT_STATS
     print_stats(args);
-    int i = 0;
-    for(i=0;i<LAST_STAT_IDX;++i)
-        if(args->stat_array[i].m_histogram)
-            free(args->stat_array[i].m_histogram);
+    destroy_stats(args);
 #endif
     if(args->m_tag)
         free(args->m_tag);
