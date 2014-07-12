@@ -131,6 +131,11 @@ typedef struct
 {
     int* m_id_2_merged_id;
     int m_num_ids;
+    //Map from original to preprocessed
+    int* m_original_id_2_preprocessed_id;
+    //Map from original to preprocessed if the field needs to be copied somewhere else
+    int* m_original_id_2_preprocessed_copy_id;
+    int m_num_original_ids;
 }reader_idmap;
 
 typedef struct
@@ -140,6 +145,8 @@ typedef struct
     int m_num_merged_ids;
     //map from id in merged hdr to index in merged bcf1_t* out
     int* m_merged_id_2_merged_idx; 
+    //map from id in merged hdr to index in info_rules, -1 if none
+    int* m_merged_id_2_info_rule_idx;
 }idmap;
 
 typedef struct
@@ -187,6 +194,7 @@ kstring_t g_debug_string = { 0, 0, 0 };
 #endif
 unsigned g_preprocess_vcfs = 0;
 unsigned g_is_input_gvcf = 0;
+unsigned g_do_gatk_merge = 0;
 const char* g_info2format_suffix = "_INFO";
 
 //Merge configuration
@@ -198,10 +206,7 @@ enum MergeActionEnum
   MERGE_KEEP,
   MERGE_DROP,
   MERGE_MOVE_TO_FORMAT,
-  MERGE_MEAN,
-  MERGE_SUM,
-  MERGE_MIN,
-  MERGE_MAX
+  MERGE_COPY_TO_FORMAT,
 };
 #define do_detach(action_type) ((action_type) == MERGE_DROP || (action_type) == MERGE_MOVE_TO_FORMAT)
 typedef struct
@@ -301,7 +306,110 @@ void print_stats(args_t* args)
 }
 #endif
 
+/**
+ * Unfortunately, this has to be a macro, because different data types are used, C++ templates would solve this
+ * line: current reader's line being considered for merging
+ * length_type: one of BCF_VL_*
+ * als: maux1_t* which contains mapping for alleles
+ * nout_als: number of alleles (including REF) in the merged line
+ * src: correctly typecast array for the current field for the current reader's line
+ * dst: correctly typecast array for the current field for the merged line
+ * dst_type_t: type of the destination array
+**/
+#define initialize_ARG_vectors_for_NON_REF(line, length_type, als, nout_als, src, src_length, dst, dst_type_t) \
+{ \
+    /*FIXME: Works only for haploid and diploid*/ \
+    /*copy values corresponding to NON_REF allele instead of missing value*/ \
+    ASSERT(line->m_non_ref_idx >= 1 && line->m_non_ref_idx < line->n_allele); \
+    ASSERT(line->d.var[line->m_non_ref_idx].type == VCF_NON_REF); \
+    int l = 0; \
+    if(length_type == BCF_VL_A || length_type == BCF_VL_R) \
+    { \
+        int exclude_ref = (length_type == BCF_VL_A) ? 1 : 0; \
+        /*-exclude_ref because m_non_ref_idx includes REF also, however, vector of length A does not*/ \
+        int ndst = nout_als - exclude_ref; \
+        /*printf("Out num alleles %d input num allele %d non_ref idx %d\n", nout_als, line->n_allele, line->m_non_ref_idx);*/ \
+        /*-exclude_ref because m_non_ref_idx includes REF also, however, vector of length A does not*/ \
+        dst_type_t non_ref_val = (dst_type_t)(src[line->m_non_ref_idx-exclude_ref]); \
+        /*printf("Non ref val %d\n",(int)non_ref_val);*/ \
+        for(l=0;l<ndst;++l) \
+            dst[l] = non_ref_val; \
+    } \
+    else \
+    { \
+        if(length_type == BCF_VL_G) \
+        { \
+            int is_diploid = (src_length > line->n_allele); \
+            if(is_diploid) \
+            { \
+                /*ref|ref GT val*/ \
+                dst[bcf_alleles2gt(0, 0)] = (dst_type_t)(src[bcf_alleles2gt(0,0)]); \
+                /*values for ref|non_ref from src - copy for every GT where ref|<other> occurs*/ \
+                dst_type_t ref_non_ref_gt_val = (dst_type_t)(src[bcf_alleles2gt(0, line->m_non_ref_idx)]); \
+                /*values for non_ref|non_ref from src - copy for every GT without ref*/ \
+                dst_type_t non_ref_non_ref_gt_val = (dst_type_t)(src[bcf_alleles2gt(line->m_non_ref_idx, line->m_non_ref_idx)]); \
+                /*printf("GT format ref/non-ref %d non-ref/non-ref %d\n",(int)ref_non_ref_gt_val, (int)non_ref_non_ref_gt_val);*/ \
+                for(l=1;l<nout_als;++l) \
+                { \
+                    /*Copy ref|non-ref GT values*/ \
+                    dst[bcf_alleles2gt(0, l)] = ref_non_ref_gt_val; \
+                    int m = 1; \
+                    /*Copy non-ref|non-ref GT values*/ \
+                    for(m=1;m<=l;++m) \
+                        dst[bcf_alleles2gt(m, l)] = non_ref_non_ref_gt_val; \
+                } \
+                /*for GT of type var|<other> where var exists in current file, but other may or may not exist*/ \
+                /*fill such entries with value corresponding to GT var|<non_ref>*/ \
+                for(l=1;l<line->n_allele;++l) \
+                { \
+                    int lnew = als->map[l]; \
+                    dst_type_t val = (dst_type_t)(src[bcf_alleles2gt(l, line->m_non_ref_idx)]); \
+                    int m = 1; \
+                    for(m=1;m<nout_als;++m) \
+                        dst[bcf_alleles2gt(m, lnew)] = val; \
+                } \
+            } \
+            else /*haploid*/ \
+            { \
+                dst_type_t non_ref_val = (dst_type_t)(src[line->m_non_ref_idx]); \
+                for (l=0; l<nout_als; l++) { dst[l] = non_ref_val; } \
+            } \
+        } \
+    } \
+}
 
+//Templates!
+#define comparator(data_type) \
+int data_type ## _comparator(const void* aptr, const void* bptr) \
+{ \
+    data_type a = *((data_type*)aptr); \
+    data_type b = *((data_type*)bptr); \
+    return (a < b) ? -1 : (a == b) ? 0 : 1; \
+}
+
+comparator(int32_t) 
+comparator(float) 
+
+static void info_rules_merge_median(bcf_hdr_t *hdr, bcf1_t *line, info_rule_t *rule)
+{
+    if ( !rule->nvals ) return;
+    int i, ndim = rule->block_size;
+    assert(ndim == 1 && rule->nvals == rule->nblocks && "Only single value fields are handled by median merge");
+    #define BRANCH(type_t,is_missing, comparator) { \
+        type_t *ptr = (type_t*) rule->vals; \
+        for (i=0; i<rule->nvals; i++) if ( is_missing ) ptr[i] = 0; \
+        qsort(ptr, rule->nvals, sizeof(type_t), comparator); /*FIXME: use selection algorithm for median*/ \
+        ptr[0] = ptr[rule->nvals/2]; /*middle element*/ \
+    }
+    switch (rule->type) {
+        case BCF_HT_INT:  BRANCH(int32_t, ptr[i]==bcf_int32_missing, int32_t_comparator); break;
+        case BCF_HT_REAL: BRANCH(float, bcf_float_is_missing(ptr[i]), float_comparator); break;
+        default: error("TODO: %s:%d .. type=%d\n", __FILE__,__LINE__, rule->type);
+    }
+    #undef BRANCH
+
+    bcf_update_info(hdr,line,rule->hdr_tag,rule->vals,ndim,rule->type);
+}
 static void info_rules_merge_sum(bcf_hdr_t *hdr, bcf1_t *line, info_rule_t *rule)
 {
     if ( !rule->nvals ) return;
@@ -402,18 +510,22 @@ static void info_rules_merge_join(bcf_hdr_t *hdr, bcf1_t *line, info_rule_t *rul
         bcf_update_info(hdr,line,rule->hdr_tag,rule->vals,rule->nvals,rule->type);
 }
 
+#ifndef USE_ID_MAP
 static int info_rules_comp_key2(const void *a, const void *b)
 {
     info_rule_t *rule1 = (info_rule_t*) a;
     info_rule_t *rule2 = (info_rule_t*) b;
     return strcmp(rule1->hdr_tag, rule2->hdr_tag);
 }
+
 static int info_rules_comp_key(const void *a, const void *b)
 {
     char *key = (char*) a;
     info_rule_t *rule = (info_rule_t*) b;
     return strcmp(key, rule->hdr_tag);
 }
+#endif
+
 static void info_rules_init(args_t *args)
 {
     if ( args->info_rules && !strcmp("-",args->info_rules) ) return;
@@ -450,9 +562,14 @@ static void info_rules_init(args_t *args)
         info_rule_t *rule = &args->rules[n];
         rule->hdr_tag = strdup(ss);
         int id = bcf_hdr_id2int(args->out_hdr, BCF_DT_ID, rule->hdr_tag);
+        ASSERT(strcmp(args->out_hdr->id[BCF_DT_ID][id].key, rule->hdr_tag) == 0);
         if ( !bcf_hdr_idinfo_exists(args->out_hdr,BCF_HL_INFO,id) ) error("The tag is not defined in the header: \"%s\"\n", rule->hdr_tag);
         rule->type = bcf_hdr_id2type(args->out_hdr,BCF_HL_INFO,id);
         if ( rule->type!=BCF_HT_INT && rule->type!=BCF_HT_REAL && rule->type!=BCF_HT_STR ) error("The type is not supported: \"%s\"\n", rule->hdr_tag);
+#ifdef USE_ID_MAP
+        ASSERT(id >= 0 && id < args->out_hdr->n[BCF_DT_ID]);
+        args->m_idmap.m_merged_id_2_info_rule_idx[id] = n;
+#endif
 
         while ( *ss ) ss++; ss++;
         if ( !*ss ) error("Could not parse INFO rules, missing logic of \"%s\"\n", rule->hdr_tag);
@@ -460,6 +577,7 @@ static void info_rules_init(args_t *args)
         int is_join = 0;
         if ( !strcasecmp(ss,"sum") ) rule->merger = info_rules_merge_sum;
         else if ( !strcasecmp(ss,"avg") ) rule->merger = info_rules_merge_avg;
+        else if ( !strcasecmp(ss,"median") ) rule->merger = info_rules_merge_median;
         else if ( !strcasecmp(ss,"min") ) rule->merger = info_rules_merge_min;
         else if ( !strcasecmp(ss,"max") ) rule->merger = info_rules_merge_max;
         else if ( !strcasecmp(ss,"join") ) { rule->merger = info_rules_merge_join; is_join = 1; }
@@ -484,8 +602,9 @@ static void info_rules_init(args_t *args)
     }
     free(str.s);
     free(tmp);
-
+#ifndef USE_ID_MAP
     qsort(args->rules, args->nrules, sizeof(*args->rules), info_rules_comp_key2);
+#endif
 }
 static void info_rules_destroy(args_t *args)
 {
@@ -507,7 +626,8 @@ static void info_rules_reset(args_t *args)
 static int info_rules_add_values(args_t *args, bcf_hdr_t *hdr, bcf1_t *line, info_rule_t *rule, maux1_t *als, int var_len)
 {
     int ret = bcf_get_info_values(hdr, line, rule->hdr_tag, &args->maux->tmp_arr, &args->maux->ntmp_arr, rule->type);
-    if ( ret<=0 ) error("FIXME: error parsing %s at %s:%d .. %d\n", rule->hdr_tag,bcf_seqname(hdr,line),line->pos+1,ret);
+    if ( ret<=0 )
+        error("FIXME: error parsing %s at %s:%d .. %d\n", rule->hdr_tag,bcf_seqname(hdr,line),line->pos+1,ret);
 
     rule->nblocks++;
 
@@ -568,11 +688,13 @@ static int info_rules_add_values(args_t *args, bcf_hdr_t *hdr, bcf1_t *line, inf
     }
     else
     {
+        //FIXME: will not work for non-deterministic variable length INFO fields
         if ( rule->nblocks>1 && ret!=rule->block_size )
             error("Mismatch in number of values for INFO/%s at %s:%d\n", rule->hdr_tag,bcf_seqname(hdr,line),line->pos+1);
         rule->block_size = ret;
         args->maux->nagr_map = 0;
     }
+    maux_t* ma = args->maux;
 
     #define BRANCH(src_type_t,dst_type_t,set_missing) { \
         src_type_t *src = (src_type_t *) args->maux->tmp_arr; \
@@ -585,7 +707,12 @@ static int info_rules_add_values(args_t *args, bcf_hdr_t *hdr, bcf1_t *line, inf
         } \
         else \
         { \
-            for (i=0; i<rule->block_size; i++) set_missing; \
+            if(line->m_non_ref_idx >= 0) \
+            { \
+                initialize_ARG_vectors_for_NON_REF(line, var_len, als, (ma->nout_als), src, ret, dst, dst_type_t); \
+            } \
+            else \
+                for (i=0; i<rule->block_size; i++) set_missing; \
             for (i=0; i<ret; i++) dst[args->maux->agr_map[i]] = src[i]; \
         } \
     }
@@ -911,13 +1038,15 @@ void merge_chrom2qual(args_t *args, bcf1_t *out)
                 kh_put(strdict, tmph, line->d.id, &ret);
             }
         }
-
         // set QUAL to the max qual value. Not exactly correct, but good enough for now
         if ( !bcf_float_is_missing(files->readers[i].buffer[0]->qual) )
         {
             if ( bcf_float_is_missing(out->qual) || out->qual < files->readers[i].buffer[0]->qual ) out->qual = files->readers[i].buffer[0]->qual;
         }
     }
+    //QUAL is ignored in GATK GenotypeGVCF
+    if(g_do_gatk_merge)
+        bcf_float_set_missing(out->qual);
 
     // set ID
     if ( !tmps->l ) kputs(".", tmps);
@@ -967,32 +1096,33 @@ void merge_filter(args_t *args, bcf1_t *out)
 
     maux_t *ma = args->maux;
     out->d.n_flt = 0;
-    for (i=0; i<files->nreaders; i++)
-    {
-        if ( !ma->has_line[i]) continue;
-
-        bcf_sr_t *reader = &files->readers[i];
-        bcf1_t *line = reader->buffer[0];
-        bcf_hdr_t *hdr = reader->processed_header;
-        bcf_unpack(line, BCF_UN_ALL);
-
-        int k;
-        for (k=0; k<line->d.n_flt; k++)
+    if(!g_do_gatk_merge) //GATK GenotypeGVCF merge ignores filters
+        for (i=0; i<files->nreaders; i++)
         {
-            const char *flt = hdr->id[BCF_DT_ID][line->d.flt[k]].key;
-            kitr = kh_get(strdict, tmph, flt);
-            //if filter not already added, add
-            if ( kitr == kh_end(tmph) )
+            if ( !ma->has_line[i]) continue;
+
+            bcf_sr_t *reader = &files->readers[i];
+            bcf1_t *line = reader->buffer[0];
+            bcf_hdr_t *hdr = reader->processed_header;
+            bcf_unpack(line, BCF_UN_ALL);
+
+            int k;
+            for (k=0; k<line->d.n_flt; k++)
             {
-                int id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, flt);
-                if ( id==-1 ) error("The filter not defined: %s\n", flt);
-                hts_expand(int,out->d.n_flt+1,ma->mflt,ma->flt);
-                ma->flt[out->d.n_flt] = id;
-                out->d.n_flt++;
-                kh_put(strdict, tmph, flt, &ret);
+                const char *flt = hdr->id[BCF_DT_ID][line->d.flt[k]].key;
+                kitr = kh_get(strdict, tmph, flt);
+                //if filter not already added, add
+                if ( kitr == kh_end(tmph) )
+                {
+                    int id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, flt);
+                    if ( id==-1 ) error("The filter not defined: %s\n", flt);
+                    hts_expand(int,out->d.n_flt+1,ma->mflt,ma->flt);
+                    ma->flt[out->d.n_flt] = id;
+                    out->d.n_flt++;
+                    kh_put(strdict, tmph, flt, &ret);
+                }
             }
         }
-    }
     // Check if PASS is not mixed with other filters
     if ( out->d.n_flt>1 )
     {
@@ -1082,11 +1212,12 @@ int copy_string_field(char *src, int isrc, int src_len, kstring_t *dst, int idst
 static void merge_AGR_info_tag(bcf_hdr_t *hdr, bcf1_t *line, bcf_info_t *info, int len, maux1_t *als, AGR_info_t *agr)
 {
     int i;
+    maux1_t* als = &(ma->d[reader_idx][0]);
     if ( !agr->nbuf )
     {
         if ( info->type==BCF_BT_INT8 || info->type==BCF_BT_INT16 || info->type==BCF_BT_INT32 || info->type==BCF_BT_FLOAT )
         {
-            agr->nbuf = 4 * agr->nvals;
+            agr->nbuf = agr->nvals*sizeof(int); //4==sizeof(int)==sizeof(float)
             hts_expand(uint8_t,agr->nbuf,agr->mbuf,agr->buf);
             if ( info->type!=BCF_BT_FLOAT )
             {
@@ -1114,11 +1245,15 @@ static void merge_AGR_info_tag(bcf_hdr_t *hdr, bcf1_t *line, bcf_info_t *info, i
     {
         if ( len==BCF_VL_A || len==BCF_VL_R )
         {
-            int ifrom = len==BCF_VL_A ? 1 : 0;
+            int ifrom = len==BCF_VL_A ? 1 : 0;  //0 is REF allele for BCF_VL_A
             #define BRANCH(type_t, is_missing, is_vector_end, out_type_t) { \
                 type_t *src = (type_t *) info->vptr; \
                 out_type_t *tgt = (out_type_t *) agr->buf; \
                 int iori, inew; \
+                if(line->m_non_ref_idx >= 0) \
+                { \
+                    initialize_ARG_vectors_for_NON_REF(line, len, als, (ma->nout_als), src, (agr->nvals), tgt, out_type_t); \
+                } \
                 for (iori=ifrom; iori<line->n_allele; iori++) \
                 { \
                     if ( is_vector_end ) break; \
@@ -1129,7 +1264,7 @@ static void merge_AGR_info_tag(bcf_hdr_t *hdr, bcf1_t *line, bcf_info_t *info, i
                 } \
             }
             switch (info->type) {
-                case BCF_BT_INT8:  BRANCH(int8_t,  *src==bcf_int8_missing,  *src==bcf_int8_vector_end,  int); break;
+                case BCF_BT_INT8:  BRANCH(int8_t,  *src==bcf_int8_missing, *src==bcf_int8_vector_end,  int); break;
                 case BCF_BT_INT16: BRANCH(int16_t, *src==bcf_int16_missing, *src==bcf_int16_vector_end, int); break;
                 case BCF_BT_INT32: BRANCH(int32_t, *src==bcf_int32_missing, *src==bcf_int32_vector_end, int); break;
                 case BCF_BT_FLOAT: BRANCH(float,   bcf_float_is_missing(*src), bcf_float_is_vector_end(*src), float); break;
@@ -1137,12 +1272,16 @@ static void merge_AGR_info_tag(bcf_hdr_t *hdr, bcf1_t *line, bcf_info_t *info, i
             }
             #undef BRANCH
         }
-        else
+        else    //G type
         {
             #define BRANCH(type_t, is_missing, is_vector_end, out_type_t) { \
                 type_t *src = (type_t *) info->vptr; \
                 out_type_t *tgt = (out_type_t *) agr->buf; \
                 int iori,jori, inew,jnew; \
+                if(line->m_non_ref_idx >= 0)  /*NON_REF allele*/ \
+                { \
+                    initialize_ARG_vectors_for_NON_REF(line, len, als, (ma->nout_als), src, (agr->nvals), tgt, out_type_t); \
+                } \
                 for (iori=0; iori<line->n_allele; iori++) \
                 { \
                     inew = als->map[iori]; \
@@ -1254,9 +1393,17 @@ void merge_info(args_t *args, bcf1_t *out)
             int len = bcf_hdr_id2length(hdr,BCF_HL_INFO,inf->key);
             if ( args->nrules )
             {
+#ifdef USE_ID_MAP
+                //avoid string search - use indexing
+                int info_rule_idx = args->m_idmap.m_merged_id_2_info_rule_idx[id];
+                ASSERT(info_rule_idx < args->nrules);
+                info_rule_t* rule = (info_rule_idx < 0) ? 0 : &(args->rules[info_rule_idx]);
+#else
                 info_rule_t *rule = (info_rule_t*) bsearch(key, args->rules, args->nrules, sizeof(*args->rules), info_rules_comp_key);
-                if ( rule )
+#endif
+                if ( rule ) 
                 {
+                    ASSERT(strcmp(rule->hdr_tag, out_key) == 0);
                     maux1_t *als = ( len==BCF_VL_A || len==BCF_VL_G || len==BCF_VL_R ) ? &ma->d[i][0] : NULL;
                     if ( info_rules_add_values(args, hdr, line, rule, als, len) ) continue;
                 }
@@ -1475,22 +1622,17 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
         if ( !fmt_map[i] ) continue;
         if ( !key ) key = files->readers[i].processed_header->id[BCF_DT_ID][fmt_map[i]->id].key;
         type = fmt_map[i]->type;
-        if ( IS_VL_G(files->readers[i].header, fmt_map[i]->id) )
-        {
-            length = BCF_VL_G;
-            nsize = out->n_allele*(out->n_allele + 1)/2;
+        int length_descriptor = bcf_hdr_id2length(files->readers[i].processed_header, BCF_HL_FMT, fmt_map[i]->id);
+        if ( IS_VL_G(files->readers[i].processed_header, fmt_map[i]->id) )
+        { 
+            length = BCF_VL_G; 
+            nsize = out->n_allele*(out->n_allele + 1)/2; 
             break;
         }
-        if ( IS_VL_A(files->readers[i].processed_header, fmt_map[i]->id) )
+        if (length_descriptor == BCF_VL_A || length_descriptor == BCF_VL_R)
         {
-            length = BCF_VL_A;
-            nsize = out->n_allele - 1;
-            break;
-        }
-        if ( IS_VL_R(files->readers[i].header, fmt_map[i]->id) )
-        {
-            length = BCF_VL_R;
-            nsize = out->n_allele;
+            length = length_descriptor;
+            nsize = (length_descriptor == BCF_VL_A) ? out->n_allele - 1 : out->n_allele;
             break;
         }
         if ( fmt_map[i]->n > nsize ) nsize = fmt_map[i]->n;
@@ -1509,6 +1651,7 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
         bcf_sr_t *reader = &files->readers[i];
         bcf_hdr_t *hdr = reader->processed_header;
         bcf_fmt_t *fmt_ori = fmt_map[i];
+        maux1_t* als = &(ma->d[i][0]);
         if ( fmt_ori )
         {
             type = fmt_ori->type;
@@ -1582,8 +1725,17 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                         continue; \
                     } \
                     int ngsize = ma->smpl_ploidy[ismpl+j]==1 ? out->n_allele : out->n_allele*(out->n_allele + 1)/2; \
-                    for (l=0; l<ngsize; l++) { tgt_set_missing; tgt++; } \
-                    for (; l<nsize; l++) { tgt_set_vector_end; tgt++; } \
+                    /*printf("Out num alleles %d num GT %d input num allele %d non_ref idx %d\n",out->n_allele, ngsize, line->n_allele, line->m_non_ref_idx);*/ \
+                    if(line->m_non_ref_idx >= 0)  /*NON_REF allele*/ \
+                    { \
+                        int src_length = (ma->smpl_ploidy[ismpl+j]==1) ? line->n_allele : (line->n_allele*(line->n_allele+1))/2; \
+                        initialize_ARG_vectors_for_NON_REF(line, length, als, (out->n_allele), src, src_length, tgt, tgt_type_t); \
+                    } \
+                    else \
+                    { \
+                        for (l=0; l<ngsize; l++) { tgt_set_missing; tgt++; } \
+                        for (; l<nsize; l++) { tgt_set_vector_end; tgt++; } \
+                    } \
                     if ( ma->smpl_ploidy[ismpl+j]==1 ) \
                     { \
                         /* Haploid */ \
@@ -1627,7 +1779,7 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
             else \
             { \
                 /* Number=A or Number=R tags */ \
-                int ifrom = length==BCF_VL_A ? 1 : 0; \
+                int ifrom = (length == BCF_VL_A) ? 1 : 0; \
                 for (j=0; j<bcf_hdr_nsamples(hdr); j++) \
                 { \
                     tgt = (tgt_type_t *) ma->tmp_arr + (ismpl+j)*nsize; \
@@ -1640,7 +1792,13 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                         continue; \
                     } \
                     src = (src_type_t*) (fmt_ori->p + j*fmt_ori->size); \
-                    for (l=0; l<nsize; l++) { tgt_set_missing; tgt++; } \
+                    if(line->m_non_ref_idx >= 0)  /*NON_REF allele*/ \
+                    { \
+                        int src_length =  (length == BCF_VL_R) ? line->n_allele : line->n_allele-1; \
+                        initialize_ARG_vectors_for_NON_REF(line, length, als, (out->n_allele), src, src_length, tgt, tgt_type_t); \
+                    } \
+                    else \
+                        for (l=0; l<nsize; l++) { tgt_set_missing; tgt++; } \
                     int iori,inew; \
                     for (iori=ifrom; iori<line->n_allele; iori++) \
                     { \
@@ -1711,6 +1869,8 @@ void merge_format(args_t *args, bcf1_t *out)
         {
             // Wat this tag already seen?
             bcf_fmt_t *fmt = &line->d.fmt[j];
+            if(fmt->p == 0)     //deleted
+                continue;
             const char *key = hdr->id[BCF_DT_ID][fmt->id].key;
 #ifdef USE_ID_MAP
             ASSERT(fmt->id < curr_map->m_num_ids);
@@ -1823,7 +1983,7 @@ void shake_buffer(maux_t *maux, int ir, int pos)
 #endif
 {
     bcf_sr_t *reader = &maux->files->readers[ir];
-    bcf_hdr_t* hdr = reader->header;
+    bcf_hdr_t* hdr = reader->processed_header;
     maux1_t *m = maux->d[ir];
 
     //was not involved in merge - don't bother to check further
@@ -1877,6 +2037,8 @@ void shake_buffer(maux_t *maux, int ir, int pos)
             reader->buffer[1] = reader->buffer[0];
             reader->buffer[0] = tmp;
         }
+        else
+            reader->buffer[0]->m_is_preprocessed = 0;  //this entry is done, unset preprocessed flag
         reader->buffer[0]->pos = -1;
         return;
     }
@@ -1903,6 +2065,8 @@ void shake_buffer(maux_t *maux, int ir, int pos)
         else
             if(reader->buffer[i]->m_is_split_record)
                 ++num_splits;
+            else
+                reader->buffer[i]->m_is_preprocessed = 0;       //done and not split, unset preprocessed flag
     }
     int num_dones = (last_same_pos_idx+1)-(num_splits+num_not_dones);
     int num_diff_pos = (reader->last_valid_record_idx - last_same_pos_idx);
@@ -2061,90 +2225,126 @@ int get_element_size(int bcf_ht_type)
     return -1;  //should never come here
 }
 
-void move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, bcf1_t* src, bcf1_t* dst, int file_idx)
+void preprocess_line(args_t* args, bcf_sr_t* reader, bcf1_t* line, int file_idx)
 {
+    //Translate to destination header - incorrect in this case
+    /*bcf_translate(reader->processed_header, reader->header, line);*/
+    //Drop or move/copy INFO fields to destination's FORMAT fields
     int i = 0;
     int j = 0;
+    bcf_hdr_t* src_hdr = reader->header;
+    bcf_hdr_t* dst_hdr = reader->processed_header;
     //Temporary space
     args->maux->ntmp_arr = 10;
     args->maux->tmp_arr = realloc(args->maux->tmp_arr,10*sizeof(int));
     char* format_array = (char*)malloc(1024);  //Q:why 1024 A:why not? will be realloc-ed if necessary
     int format_array_allocated = 1024;
-    char* processed_info_string = (char*)malloc(1024);  //Q:why 1024 A:why not? will be realloc-ed if necessary
-    int processed_info_string_allocated = 1024;
     //Array to quickly lookup actions from id
     int* id2action = g_merge_config.file2id2action[file_idx];
-    for(i=0;i<src->n_info;++i)
+    //Number of samples in file
+    int nsamples = bcf_hdr_nsamples(src_hdr);
+    //Deal with FORMAT fields first as INFO fields may be moved/copied to FORMAT later
+    for(i=0;i<line->n_fmt;++i)
     {
-        int dict_idx = src->d.info[i].key;
-        if(id2action[dict_idx] != MERGE_MOVE_TO_FORMAT)
-            continue;
-        bcf_idpair_t* curr_pair = &(src_hdr->id[BCF_DT_ID][dict_idx]);
-        const char* info_string = curr_pair->key;
-        int type = bcf_hdr_id2type(src_hdr, BCF_HL_INFO, dict_idx);
-        int num_values_written = bcf_get_info_values(src_hdr, src, info_string,
-                &(args->maux->tmp_arr), &(args->maux->ntmp_arr), type);
-        int element_size = get_element_size(type);
-        //No nasty error expected
-        ASSERT(num_values_written != -1 && num_values_written != -2);
-        //INFO key found - move to FORMAT
-        if(num_values_written > 0)
+        bcf_fmt_t* curr_fmt = &(line->d.fmt[i]);
+        int dict_id = curr_fmt->id;
+        int type = bcf_hdr_id2type(src_hdr, BCF_HL_FMT, dict_id);
+        //Can't declare within switch
+        int delete_info = 0;
+        switch(id2action[dict_id])
         {
-            //for flag get_info_values does not write the actual value. why? who knows
-            //Format fields have no FLAG type, convert to INT and write
-            if(type == BCF_HT_FLAG) 
-            {
-                REALLOC_IF_NEEDED(args->maux->tmp_arr, args->maux->ntmp_arr, num_values_written, int);
-                int* flag_array = (int*)(args->maux->tmp_arr);
-                for(j=0;j<num_values_written;++j)
-                    flag_array[j] = 1;
-                element_size = sizeof(int);       //using int now
-            }
-            //Add _INFO suffix
-            processed_info_string = modify_info_string(info_string, processed_info_string, &processed_info_string_allocated);
-            //INFO fields are common across samples, to move to FORMAT must increase the array
-            //size so that there is a value or list of values for every sample (identical info)
-            int nsamples = bcf_hdr_nsamples(src_hdr);
-            int bytes_per_sample = num_values_written*element_size;
-            REALLOC_IF_NEEDED(format_array, format_array_allocated, nsamples*bytes_per_sample, char);
-            int idx = 0;
-            for(j=0;j<nsamples;++j)
-            {
-                memcpy(format_array+idx, (char*)(args->maux->tmp_arr), bytes_per_sample);
-                idx += bytes_per_sample;
-            }
-            //remove INFO field
-            int delete_info = bcf_update_info(dst_hdr, dst, info_string, 0, 0, type);
-            ASSERT(delete_info >= 0);
-            //format fields have no flag type
-            bcf_update_format(dst_hdr, dst, processed_info_string, format_array, num_values_written*nsamples, type == BCF_HT_FLAG ? BCF_HT_INT : type);
+            case MERGE_KEEP:
+                break;
+            case MERGE_DROP:
+                //remove INFO field
+                delete_info = bcf_update_format_struct(src_hdr, line, 0, 0, 0, type, curr_fmt, dict_id);
+                ASSERT(delete_info >= 0);
+                break;
+            default:
+                assert(0 && "Unknown action for format field\n");
+        }
+    }
+    //handle INFO fields
+    for(i=0;i<line->n_info;++i)
+    {
+        bcf_info_t* curr_info = &(line->d.info[i]);
+        int dict_id = curr_info->key;
+        int type = bcf_hdr_id2type(src_hdr, BCF_HL_INFO, dict_id);
+        //Can't declare within switch
+        int num_values_written = 0;
+        int element_size = 0;
+        int* flag_array = 0;
+        int new_dict_id = -1;
+        int idx = 0;
+        int bytes_per_sample = 0;
+        int delete_info = 0;
+        const char* processed_info_string = 0;
+        switch(id2action[dict_id])
+        {
+            case MERGE_KEEP:
+                break;
+            case MERGE_DROP:
+                //remove INFO field
+                delete_info = bcf_update_info_struct(src_hdr, line, 0, 0, 0, type, curr_info, dict_id);
+                ASSERT(delete_info >= 0);
+                break;
+            case MERGE_COPY_TO_FORMAT:
+            case MERGE_MOVE_TO_FORMAT:
+                num_values_written = bcf_unpack_info_values(src_hdr, line, curr_info,
+                        &(args->maux->tmp_arr), &(args->maux->ntmp_arr), type);
+                element_size = get_element_size(type);
+                //No nasty error expected
+                ASSERT(num_values_written != -1 && num_values_written != -2);
+                //INFO key found - move to FORMAT
+                if(num_values_written > 0)
+                {
+                    //for flag get_info_values does not write the actual value. why? who knows
+                    //Format fields have no FLAG type, convert to INT and write
+                    if(type == BCF_HT_FLAG) 
+                    {
+                        REALLOC_IF_NEEDED(args->maux->tmp_arr, args->maux->ntmp_arr, num_values_written, int);
+                        flag_array = (int*)(args->maux->tmp_arr);
+                        for(j=0;j<num_values_written;++j)
+                            flag_array[j] = 1;
+                        element_size = sizeof(int);       //using int now
+                    }
+                    //Get new field name - name could be changed when moved to FORMAT as the original file could have a field with the
+                    //same name
+                    new_dict_id = args->m_idmap.m_readers_map[file_idx].m_original_id_2_preprocessed_copy_id[dict_id];
+                    ASSERT(new_dict_id >= 0 && new_dict_id < dst_hdr->n[BCF_DT_ID]);
+                    processed_info_string = dst_hdr->id[BCF_DT_ID][new_dict_id].key;
+                    ASSERT(processed_info_string);
+                    //either same as original info name or with _INFO suffix
+                    ASSERT(strcmp(src_hdr->id[BCF_DT_ID][dict_id].key, processed_info_string) <= 0);
+                    //INFO fields are common across samples, to move to FORMAT must increase the array
+                    //size so that there is a value or list of values for every sample (identical info)
+                    bytes_per_sample = num_values_written*element_size;
+                    REALLOC_IF_NEEDED(format_array, format_array_allocated, nsamples*bytes_per_sample, char);
+                    for(j=0,idx=0;j<nsamples;++j,idx+=bytes_per_sample)
+                        memcpy(format_array+idx, (char*)(args->maux->tmp_arr), bytes_per_sample);
+                    if(id2action[dict_id] == MERGE_MOVE_TO_FORMAT)
+                    {
+                        //remove INFO field
+                        delete_info = bcf_update_info_struct(src_hdr, line, 0, 0, 0, type, curr_info, dict_id);
+                        ASSERT(delete_info >= 0);
+                    }
+                    //format fields have no flag type
+                    bcf_update_format(dst_hdr, line, processed_info_string, format_array, num_values_written*nsamples, type == BCF_HT_FLAG ? BCF_HT_INT : type);
 #ifdef DEBUG
-            vcf_format(dst_hdr,dst,&g_debug_string);
-            fprintf(g_vcf_debug_fptr,"DEBUG:: %s",g_debug_string.s);
-            fflush(g_vcf_debug_fptr);
-            g_debug_string.l = 0;
+                    vcf_format(dst_hdr,line,&g_debug_string);
+                    fprintf(g_vcf_debug_fptr,"DEBUG:preprocessed: %s",g_debug_string.s);
+                    fflush(g_vcf_debug_fptr);
+                    g_debug_string.l = 0;
 #endif
+                }
+                break;
+            default:
+                assert(0 && "Unknown action for INFO field\n");
         }
     }
     free(format_array);
-    free(processed_info_string);
-}
-
-bcf1_t* preprocess_line(args_t* args, bcf_sr_t* reader, int file_idx)
-{
-    //Copy of source line
-    bcf1_t* new_line = bcf_dup(reader->buffer[0]);
-    bcf_unpack(reader->buffer[0], BCF_UN_ALL);
-    //Translate to destination header
-    //Deleted fields will be dropped here
-    bcf_translate(reader->processed_header, reader->header, new_line);
-    //Move INFO fields to destination's FORMAT fields
-    /*move_info_to_format(args_t* args, bcf_hdr_t* src_hdr, bcf_hdr_t* dst_hdr, bcf1_t* src, bcf1_t* dst)*/
-    move_info_to_format(args, reader->header, reader->processed_header, reader->buffer[0], new_line, file_idx);
-    bcf_unpack(new_line, BCF_UN_ALL);
-    //Destroy original bcf1_t object
-    bcf_destroy(reader->buffer[0]);
-    return new_line;
+    //set preprocessed flag
+    line->m_is_preprocessed = 1;
 }
 
 char get_reference_base_at_position(args_t* args, const char* seq_name, int pos)
@@ -2272,7 +2472,7 @@ int find_end_position(args_t* args, int* chrom_idx, char** ref_id, char* ref_bas
             (*ref_id) = 0;
 #endif
             //First base of reference allele - REF, obtain from reference file
-            const char* contig_name = reader->header->id[BCF_DT_CTG][rid].key;
+            const char* contig_name = reader->processed_header->id[BCF_DT_CTG][rid].key;
             (*ref_base) = get_reference_base_at_position(args, contig_name, end_point+1);
         }
     }
@@ -2318,7 +2518,7 @@ void align_to_end(args_t* args, int new_end_point, int chrom_idx, const char* re
     for(i=0;i<files->nreaders;++i)
     {
         bcf_sr_t* curr_reader = &(files->readers[i]);
-        bcf_hdr_t* curr_header = curr_reader->header;
+        bcf_hdr_t* curr_header = curr_reader->processed_header;
         //Only files with the min start position are considered
         if(bcf_sr_has_line(files, i))
         {
@@ -2376,6 +2576,27 @@ void merge_buffer(args_t *args)
     int i, pos = -1, var_type = 0;
     maux_reset(maux);
 
+    //Drop or move fields if necessary
+    if(g_preprocess_vcfs)
+    {
+        for (i=0; i<files->nreaders; i++)
+            if ( bcf_sr_has_line(files,i) )
+            {
+                bcf_sr_t* curr_reader = &(files->readers[i]);
+                int j = 0;
+                int last_same_pos_idx = (curr_reader->buffer[0]->pos == 
+                        curr_reader->buffer[curr_reader->nbuffer]->pos)
+                    ? curr_reader->nbuffer : curr_reader->nbuffer-1;
+                for(j=0;j<=last_same_pos_idx;++j)
+                {
+                    bcf1_t* line = curr_reader->buffer[j];
+                    bcf_unpack(line, BCF_UN_ALL);
+                    if(!line->m_is_preprocessed)
+                        preprocess_line(args, curr_reader, line, i);
+                }
+            }
+    }
+
     int end_point = -1;
     //Find the 'end' point where interval has to 'break' in gVCFs
     //Create intervals with the end position
@@ -2396,7 +2617,7 @@ void merge_buffer(args_t *args)
                 for(j=0;j<=last_same_pos_idx;++j)
                 {
                     bcf_unpack(files->readers[i].buffer[j], BCF_UN_INFO);
-                    bcf_set_end_point_from_info(files->readers[i].header, files->readers[i].buffer[j]);
+                    bcf_set_end_point_from_info(files->readers[i].processed_header, files->readers[i].buffer[j]);
                 }
             }
         end_point = find_end_position(args, &chrom_idx, &ref_id, &ref_base);
@@ -2411,7 +2632,7 @@ void merge_buffer(args_t *args)
                         files->readers[i].buffer[files->readers[i].nbuffer]->pos)
                     ? files->readers[i].nbuffer : files->readers[i].nbuffer-1;
                 for(j=0;j<=last_same_pos_idx;++j)
-                    bcf_set_end_point_in_info(files->readers[i].header, files->readers[i].buffer[j]);
+                    bcf_set_end_point_in_info(files->readers[i].processed_header, files->readers[i].buffer[j]);
             }
     }
 
@@ -2564,8 +2785,6 @@ void merge_buffer(args_t *args)
                     SWAP(bcf1_t*, reader->buffer[0], reader->buffer[j]);
                     SWAP(maux1_t, maux->d[i][0], maux->d[i][j]);
                 }
-                if(g_preprocess_vcfs)
-                    reader->buffer[0] = preprocess_line(args, reader, i);
                 // mark as finished so that it's ignored next time
                 maux->d[i][0].skip |= SKIP_DONE;
                 maux->has_line[i] = 1;
@@ -2622,23 +2841,31 @@ void bcf_hdr_append_version(bcf_hdr_t *hdr, int argc, char **argv, const char *c
 
 typedef struct
 {
-    int type;
+    int type; //BCF_HL_*
+    int id;
     const char* key;
 } erase_hrec_struct;
 
+typedef struct
+{
+    int m_original_id;
+    char* m_new_key;
+    bcf_hrec_t* m_new_hrec;
+} add_hrec_struct;
+
 //Drop unnecessary fields
-//Move INFO fields to FORMAT
-void preprocess_header(bcf_hdr_t* src_hdr, int file_idx)
+//Move/copy INFO fields to FORMAT
+void preprocess_header(args_t* args, int file_idx)
 {
     int i = 0;
     int j = 0;
-    bcf_hdr_t* hdr = src_hdr;
+    bcf_hdr_t* hdr = args->files->readers[file_idx].processed_header;
 
     //Array to store hrecs which will be erased from hdr
     erase_hrec_struct* erase_array = (erase_hrec_struct*)malloc(hdr->n[BCF_DT_ID]*sizeof(erase_hrec_struct));
     int erase_idx = 0;
     //Array to store hrecs which will be added at the end
-    bcf_hrec_t** add_array = (bcf_hrec_t**)malloc(hdr->n[BCF_DT_ID]*sizeof(bcf_hrec_t*));
+    add_hrec_struct* add_array = (add_hrec_struct*)malloc(hdr->n[BCF_DT_ID]*sizeof(add_hrec_struct));
     int add_idx = 0;
 
     //Used in preprocess_line to quickly lookup action from id (integer id)
@@ -2652,6 +2879,8 @@ void preprocess_header(bcf_hdr_t* src_hdr, int file_idx)
         int is_info = bcf_hdr_idinfo_exists(hdr, BCF_HL_INFO, i);
         int is_format = bcf_hdr_idinfo_exists(hdr, BCF_HL_FMT, i);
         g_merge_config.file2id2action[file_idx][i] = g_merge_config.default_action;
+        //Map from id to id - same as duplicate
+        args->m_idmap.m_readers_map[file_idx].m_original_id_2_preprocessed_id[i] = i;
         if(is_info || is_format)
         {
             bcf_idpair_t* curr_pair = &(hdr->id[BCF_DT_ID][i]);
@@ -2665,69 +2894,94 @@ void preprocess_header(bcf_hdr_t* src_hdr, int file_idx)
                 g_merge_config.file2id2action[file_idx][i] = MERGE_KEEP;  //keep END in INFO always
                 continue;
             }
-            // Is the action keep,min,max etc, but does not involve detach (drop or move)
-            if(!do_detach(action_type)) 
-                continue;
-            //Mark for removal
-            ASSERT(erase_idx < hdr->n[BCF_DT_ID]);
             int type = is_info ? bcf_hdr_id2type(hdr, BCF_HL_INFO, i) : bcf_hdr_id2type(hdr, BCF_HL_FMT, i);
-            erase_array[erase_idx].type = is_info ? BCF_HL_INFO : BCF_HL_FMT;
-            erase_array[erase_idx++].key = key_string;
-            //If move to format, add to FORMAT
-            if(is_info && action_type == MERGE_MOVE_TO_FORMAT)
+            // Is the action drop or move?
+            if(do_detach(action_type))
             {
+                //Mark for removal
+                ASSERT(erase_idx < hdr->n[BCF_DT_ID]);
+                erase_array[erase_idx].id = i;
+                erase_array[erase_idx].type = is_info ? BCF_HL_INFO : BCF_HL_FMT;
+                erase_array[erase_idx++].key = key_string;
+                //This field does not exist, mark invalid
+                args->m_idmap.m_readers_map[file_idx].m_original_id_2_preprocessed_id[i] = -1;
+            }
+            if(is_format && g_do_gatk_merge && strcmp(key_string,"AD") == 0)  //For AD, Number=R - in some gVCFs the Number is set to '.'
+                bcf_hdr_set_length_descriptor(hdr, BCF_HL_FMT, i, BCF_VL_R);
+            //If move to format, add to FORMAT
+            if(is_info && (action_type == MERGE_MOVE_TO_FORMAT || action_type == MERGE_COPY_TO_FORMAT))
+            {
+                //if there is a FORMAT field with the exact same name, don't bother to move/copy
+                //instead just DROP if move is requested
+                if(bcf_hdr_field_name2id(hdr,key_string, BCF_DT_ID, BCF_HL_FMT) >= 0)
+                {
+                    if(action_type == MERGE_MOVE_TO_FORMAT)
+                        g_merge_config.file2id2action[file_idx][i] = MERGE_DROP;
+                    else
+                        g_merge_config.file2id2action[file_idx][i] = MERGE_KEEP;
+                    continue;
+                }
                 //Create a copy of hrec as we will remove that hrec from the header and add new hrec
                 bcf_hrec_t* orig_hrec = bcf_hdr_id2hrec(hdr, BCF_DT_ID, BCF_HL_INFO, i);
                 ASSERT(orig_hrec);
-                bcf_hrec_t* tmp = bcf_hrec_dup(orig_hrec);
+                bcf_hrec_t* new_hrec = bcf_hrec_dup(orig_hrec);
                 //change type to FORMAT
-                tmp->type = BCF_HL_FMT;
-                tmp->key = (char*)realloc(tmp->key, strlen("FORMAT")+1);        //for end NULL char
-                strcpy(tmp->key, "FORMAT");
+                new_hrec->type = BCF_HL_FMT;
+                new_hrec->key = (char*)realloc(new_hrec->key, strlen("FORMAT")+1);        //for end NULL char
+                strcpy(new_hrec->key, "FORMAT");
                 //Find ID field in INFO hrec and change its value
-                int idx = bcf_hrec_find_key(tmp, "ID");
+                int idx = bcf_hrec_find_key(new_hrec, "ID");
                 ASSERT(idx >= 0);
-                tmp->vals[idx] = modify_info_string(tmp->vals[idx], tmp->vals[idx], 0);
+                //If there is a FORMAT field with the same name, add _INFO suffix
+                char* new_key_string = new_hrec->vals[idx];
+                /*modify_info_string(new_hrec->vals[idx], new_hrec->vals[idx], 0) : */
+                new_hrec->vals[idx] = new_key_string;
                 //FORMAT fields do not have FLAG type, convert to int if this field is of type FLAG
                 if(type == BCF_HT_FLAG)
                 {
                     //Number == 0 for all FLAG types in INFO, set to 1 for FORMAT field
-                    idx = bcf_hrec_find_key(tmp, "Number");
+                    idx = bcf_hrec_find_key(new_hrec, "Number");
                     if(idx <  0)    //No such field exists, add field first
                     {
-                        bcf_hrec_add_key(tmp,"Number",strlen("Number")); 
-                        idx = bcf_hrec_find_key(tmp, "Number");
+                        bcf_hrec_add_key(new_hrec,"Number",strlen("Number")); 
+                        idx = bcf_hrec_find_key(new_hrec, "Number");
                     }
                     ASSERT(idx >= 0);
-                    bcf_hrec_set_val(tmp, idx, "1", 1, 0);
+                    bcf_hrec_set_val(new_hrec, idx, "1", 1, 0);
                     //Change type to Integer
-                    idx = bcf_hrec_find_key(tmp, "Type");
+                    idx = bcf_hrec_find_key(new_hrec, "Type");
                     if(idx <  0)    //No such field exists, add field first
                     {
-                        bcf_hrec_add_key(tmp,"Type",strlen("Type")); 
-                        idx = bcf_hrec_find_key(tmp, "Type");
+                        bcf_hrec_add_key(new_hrec,"Type",strlen("Type")); 
+                        idx = bcf_hrec_find_key(new_hrec, "Type");
                     }
                     ASSERT(idx >= 0);
-                    bcf_hrec_set_val(tmp, idx, "Integer", strlen("Integer"), 0);
+                    bcf_hrec_set_val(new_hrec, idx, "Integer", strlen("Integer"), 0);
                 }
                 ASSERT(add_idx < hdr->n[BCF_DT_ID]);
                 //Store format field to add to new hdr
-                add_array[add_idx++] = tmp;
+                add_array[add_idx].m_original_id = i;
+                add_array[add_idx].m_new_key = new_key_string;
+                add_array[add_idx++].m_new_hrec = new_hrec;
             }
         }
     }
+    //Erase hrecs
+    for(j=0;j<erase_idx;++j)
+        bcf_hdr_remove(hdr, BCF_DT_ID, erase_array[j].key);
+    free(erase_array);
     //Add hrecs
     for(j=0;j<add_idx;++j)
     {
-        bcf_hdr_add_hrec(hdr, add_array[j]);
+        bcf_hdr_add_hrec(hdr, add_array[j].m_new_hrec);
+        int new_id = bcf_hdr_field_name2id(hdr, add_array[j].m_new_key, BCF_DT_ID, add_array[j].m_new_hrec->type);
+        ASSERT(new_id >= 0);
+        //Store mapping from original id to new id
+        //The field is copied - so store in copy id array
+        int original_id = add_array[j].m_original_id;
+        args->m_idmap.m_readers_map[file_idx].m_original_id_2_preprocessed_copy_id[original_id] = new_id;
     }
     free(add_array);
-    //Erase hrecs
-    for(j=0;j<erase_idx;++j)
-    {
-        bcf_hdr_remove(hdr, erase_array[j].type, erase_array[j].key);
-    }
-    free(erase_array);
 #ifdef DEBUG
     int hdr_str_length = 0;
     char* hdr_str = bcf_hdr_fmt_text(hdr, 0, &hdr_str_length);
@@ -2737,18 +2991,40 @@ void preprocess_header(bcf_hdr_t* src_hdr, int file_idx)
 #endif
 }
 
+void allocate_original_idmap(args_t* args)
+{
+    int i = 0;
+    //map from ids of file i to merged hdr ids
+    args->m_idmap.m_readers_map = (reader_idmap*)calloc(args->files->nreaders, sizeof(reader_idmap));
+    for(i=0;i<args->files->nreaders;++i)
+    {
+        reader_idmap* curr_map = &(args->m_idmap.m_readers_map[i]);
+        bcf_hdr_t* hdr = args->files->readers[i].header;
+        curr_map->m_num_original_ids = hdr->n[BCF_DT_ID];
+        curr_map->m_original_id_2_preprocessed_id = (int*)malloc(curr_map->m_num_original_ids*sizeof(int));
+        curr_map->m_original_id_2_preprocessed_copy_id = (int*)malloc(curr_map->m_num_original_ids*sizeof(int));
+        //set to invalid value -1
+        memset(curr_map->m_original_id_2_preprocessed_id, -1, curr_map->m_num_original_ids*sizeof(int));
+        memset(curr_map->m_original_id_2_preprocessed_copy_id, -1, curr_map->m_num_original_ids*sizeof(int));
+    }
+}
+
 void setup_idmap(args_t* args)
 {
     int i = 0;
     int j = 0;
-    bcf_hdr_t* out_hdr = args->out_hdr;
     //map from ids of file i to merged hdr ids
-    args->m_idmap.m_readers_map = (reader_idmap*)calloc(args->files->nreaders, sizeof(reader_idmap));
+    if(args->m_idmap.m_readers_map == 0)
+        allocate_original_idmap(args);
+    bcf_hdr_t* out_hdr = args->out_hdr;
     args->m_idmap.m_num_merged_ids = out_hdr->n[BCF_DT_ID];
     //map from merged ids to ids of file i
     args->m_idmap.m_merged_id_2_reader_idmap = (int**)malloc(args->files->nreaders*sizeof(int*));
     //map from id in merged hdr to index in merged bcf1_t* out
     args->m_idmap.m_merged_id_2_merged_idx = (int*)malloc(args->m_idmap.m_num_merged_ids*sizeof(int));
+    //map from id in merged hdr to info_rule index
+    args->m_idmap.m_merged_id_2_info_rule_idx = (int*)malloc(args->m_idmap.m_num_merged_ids*sizeof(int));
+    memset(args->m_idmap.m_merged_id_2_info_rule_idx, -1, args->m_idmap.m_num_merged_ids*sizeof(int));
     for(i=0;i<args->files->nreaders;++i)
     {
         //map from merged ids to ids of file i
@@ -2763,19 +3039,26 @@ void setup_idmap(args_t* args)
         for(j=0;j<curr_hdr->n[BCF_DT_ID];++j)
         {
             bcf_idpair_t* curr_id = &(curr_hdr->id[BCF_DT_ID][j]);
+            if(curr_id->key == 0)       //deleted
+                continue;
             ASSERT(curr_id->val->id == j);
-            const char* key = curr_id->key;
-            int out_idx = bcf_hdr_id2int(out_hdr, BCF_DT_ID, key);
-#ifdef DEBUG
             int col_type = bcf_hdr_idinfo_exists(curr_hdr,BCF_HL_FLT, j) ? BCF_HL_FLT : 
                 bcf_hdr_idinfo_exists(curr_hdr,BCF_HL_INFO, j) ? BCF_HL_INFO :
                 bcf_hdr_idinfo_exists(curr_hdr,BCF_HL_FMT, j) ? BCF_HL_FMT : -1;
             ASSERT(col_type != -1);
-            ASSERT(out_idx >= 0 && out_idx < out_hdr->n[BCF_DT_ID]);
-            ASSERT(bcf_hdr_idinfo_exists(out_hdr, col_type, out_idx));  //same coltype as input
+            bcf_hrec_t* hrec = bcf_hdr_id2hrec(curr_hdr, BCF_DT_ID, col_type, j);
+            int out_idx = -1;
+            if(hrec)       //not deleted
+            {
+                const char* key = curr_id->key;
+                out_idx = bcf_hdr_id2int(out_hdr, BCF_DT_ID, key);
+#ifdef DEBUG
+                ASSERT(out_idx >= 0 && out_idx < out_hdr->n[BCF_DT_ID]);
+                ASSERT(bcf_hdr_idinfo_exists(out_hdr, col_type, out_idx));  //same coltype as input
 #endif
+                args->m_idmap.m_merged_id_2_reader_idmap[i][out_idx] = j;
+            }
             curr_map->m_id_2_merged_id[j] = out_idx;
-            args->m_idmap.m_merged_id_2_reader_idmap[i][out_idx] = j;
         }
     }
 }
@@ -2789,11 +3072,14 @@ void destroy_idmap(args_t* args)
         {
             reader_idmap* ptr = &(args->m_idmap.m_readers_map[i]);
             free(ptr->m_id_2_merged_id);
+            free(ptr->m_original_id_2_preprocessed_id);
+            free(ptr->m_original_id_2_preprocessed_copy_id);
             free(args->m_idmap.m_merged_id_2_reader_idmap[i]);
         }
         free(args->m_idmap.m_readers_map);
         free(args->m_idmap.m_merged_id_2_reader_idmap);
         free(args->m_idmap.m_merged_id_2_merged_idx);
+        free(args->m_idmap.m_merged_id_2_info_rule_idx);
     }
 }
 
@@ -2817,6 +3103,7 @@ void merge_vcf(args_t *args)
             g_merge_config.file2id2action = (int**)malloc(args->files->nreaders*sizeof(int*));
             g_merge_config.num_files = args->files->nreaders;
         }
+        allocate_original_idmap(args);
         for (i=0; i<args->files->nreaders; i++)
         {
             char buf[10]; snprintf(buf,10,"%d",i+1);
@@ -2825,7 +3112,7 @@ void merge_vcf(args_t *args)
             {
                 args->files->readers[i].header->ntransl = 0;    //required for bcf_translate later
                 args->files->readers[i].processed_header = bcf_hdr_dup(args->files->readers[i].header);
-                preprocess_header(args->files->readers[i].processed_header, i);
+                preprocess_header(args, i);
                 hdr = args->files->readers[i].processed_header;
             }
             else                //else point to same header
@@ -2924,14 +3211,8 @@ void parse_merge_config(char* filename)
     kh_val(g_merge_config_token_2_idx, kitr) = MERGE_DROP;
     kitr = kh_put(strdict, g_merge_config_token_2_idx, "MOVE_TO_FORMAT", &ret);
     kh_val(g_merge_config_token_2_idx, kitr) = MERGE_MOVE_TO_FORMAT;
-    kitr = kh_put(strdict, g_merge_config_token_2_idx, "MEAN", &ret);
-    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_MEAN;
-    kitr = kh_put(strdict, g_merge_config_token_2_idx, "SUM", &ret);
-    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_SUM;
-    kitr = kh_put(strdict, g_merge_config_token_2_idx, "MIN", &ret);
-    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_MIN;
-    kitr = kh_put(strdict, g_merge_config_token_2_idx, "MAX", &ret);
-    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_MAX;
+    kitr = kh_put(strdict, g_merge_config_token_2_idx, "COPY_TO_FORMAT", &ret);
+    kh_val(g_merge_config_token_2_idx, kitr) = MERGE_COPY_TO_FORMAT;
 
     //Initialize merge_config structure
     g_merge_config.default_action = MERGE_KEEP;
@@ -2987,8 +3268,9 @@ void parse_merge_config(char* filename)
                 kitr = kh_get(strdict, g_merge_config_token_2_idx, ptr);
                 assert(kitr != kh_end(g_merge_config_token_2_idx) && "Unknown action for INFO/FORMAT");
                 int action_type = kh_val(g_merge_config_token_2_idx, kitr);
-                assert((action_type == MERGE_KEEP || action_type == MERGE_DROP || action_type == MERGE_MOVE_TO_FORMAT)
-                        && "Action to INFO/FORMAT must be KEEP|DROP|MOVE_TO_FORMAT");
+                assert((action_type == MERGE_KEEP || action_type == MERGE_DROP || action_type == MERGE_MOVE_TO_FORMAT
+                            || action_type == MERGE_COPY_TO_FORMAT)
+                        && "Action to INFO/FORMAT must be KEEP|DROP|MOVE_TO_FORMAT|COPY_TO_FORMAT");
                 if(token_type == MERGE_INFO)
                 {
                     kh_put(strdict, g_merge_config.info_field2action, field, &ret);
@@ -3003,6 +3285,7 @@ void parse_merge_config(char* filename)
                     assert(kitr != kh_end(g_merge_config.format_field2action));
                     kh_val(g_merge_config.format_field2action, kitr) = action_type;
                 }
+                free(ptr);
                 break;
             default:
                 fprintf(stderr,"Unexpected token %s at line %d .. skipping to next line\n",ptr,line_number);
@@ -3073,6 +3356,7 @@ enum ArgsIdxEnum
   ARGS_IDX_MERGE_CONFIG_FILE=1000,
   ARGS_IDX_REFERENCE_FILE,
   ARGS_IDX_INPUT_GVCFS,
+  ARGS_IDX_DO_GATK_MERGE,
   ARGS_IDX_TAG
 };
 
@@ -3111,6 +3395,7 @@ int main_vcfmerge(int argc, char *argv[])
         {"reference",1,0,ARGS_IDX_REFERENCE_FILE},
         {"gvcf",0,0,ARGS_IDX_INPUT_GVCFS},
         {"tag",1,0,ARGS_IDX_TAG},
+        {"gatk",0,0,ARGS_IDX_DO_GATK_MERGE},
         {0,0,0,0}
     };
     while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:l:",loptions,NULL)) >= 0) {
@@ -3148,6 +3433,7 @@ int main_vcfmerge(int argc, char *argv[])
             case ARGS_IDX_REFERENCE_FILE: initialize_reference(args, optarg); break;
             case ARGS_IDX_INPUT_GVCFS: g_is_input_gvcf = 1; break;
             case ARGS_IDX_TAG:  args->m_tag = strdup(optarg); break;
+            case ARGS_IDX_DO_GATK_MERGE: g_do_gatk_merge = 1; break;
             case 'h': 
             case '?': usage();
             default: error("Unknown argument: %s\n", optarg);
@@ -3183,13 +3469,13 @@ int main_vcfmerge(int argc, char *argv[])
     merge_vcf(args);
     //DESTRUCTION IS A FUNCTION!!!
     destroy_idmap(args);
-    bcf_sr_destroy(args->files);
     if(g_preprocess_vcfs)       //destroy modified headers
     {
         int i;
         for(i=0;i<args->files->nreaders;++i)
             bcf_hdr_destroy(args->files->readers[i].processed_header);
     }
+    bcf_sr_destroy(args->files);
     destroy_merge_config();
     destroy_reference(args);
 #ifdef COLLECT_STATS

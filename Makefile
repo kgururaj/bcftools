@@ -39,7 +39,7 @@ TABIX  = $(HTSDIR)/tabix
 CC=			gcc
 LDLIBS=
 ifdef DEBUG
-    CFLAGS = -g -g3 -DDEBUG
+    CFLAGS = -g -gdwarf-2 -g3 -DDEBUG
 else
     CFLAGS = -O3
 endif

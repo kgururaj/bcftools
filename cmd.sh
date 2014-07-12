@@ -1,0 +1,1 @@
+./bcftools merge  --merge-config=config.sample --gatk -i BaseQRankSum:median,MQ:median,MQ0:median,ClippingRankSum:median,MQRankSum:median,ReadPosRankSum:median,DP:sum -m all --gvcf --reference=test_inputs/Homo_sapiens_assembly19.fasta $@

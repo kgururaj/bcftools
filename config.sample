@@ -5,8 +5,9 @@
 #KEEP - no change, DROP 
 DEFAULT KEEP
 #Convert INFO fields BaseQRankSum,END,DS to FORMAT fields
-INFO    BaseQRankSum    MOVE_TO_FORMAT
-INFO    END     MOVE_TO_FORMAT
-INFO    DS      MOVE_TO_FORMAT
-#Drop FORMAT field MIN_DP
-FORMAT  MIN_DP  DROP
+INFO    DS      DROP 
+INFO    DP      COPY_TO_FORMAT
+INFO    MLEAC   DROP
+INFO    MLEAF   DROP
+FORMAT  GQ      DROP
+
