@@ -63,6 +63,7 @@ AGR_info_t;
 typedef struct _info_rule_t
 {
     char *hdr_tag;
+    int merged_id;
     void (*merger)(bcf_hdr_t *hdr, bcf1_t *line, struct _info_rule_t *rule);
     int type;           // one of BCF_HT_*
     int block_size;     // number of values in a block
@@ -147,6 +148,21 @@ typedef struct
     int* m_merged_id_2_merged_idx; 
     //map from id in merged hdr to index in info_rules, -1 if none
     int* m_merged_id_2_info_rule_idx;
+    //ids corresponding to DP
+    int m_merged_DP_info_id;
+    int m_merged_DP_format_id;
+    //index vs/ id
+    int m_merged_DP_info_idx;
+    int m_merged_DP_format_idx;
+    //array containing file ids with valid DP INFO fields in current record being merged
+    int* m_DP_info_vals;
+    //ids corresponding to MIN_DP
+    int m_merged_MIN_DP_format_id;
+    //index vs/ id
+    int m_merged_MIN_DP_format_idx;
+
+    //END id
+    int m_merged_END_info_id;
 }idmap;
 
 typedef struct
@@ -569,6 +585,7 @@ static void info_rules_init(args_t *args)
 #ifdef USE_ID_MAP
         ASSERT(id >= 0 && id < args->out_hdr->n[BCF_DT_ID]);
         args->m_idmap.m_merged_id_2_info_rule_idx[id] = n;
+        rule->merged_id = id;
 #endif
 
         while ( *ss ) ss++; ss++;
@@ -628,7 +645,6 @@ static int info_rules_add_values(args_t *args, bcf_hdr_t *hdr, bcf1_t *line, inf
     int ret = bcf_get_info_values(hdr, line, rule->hdr_tag, &args->maux->tmp_arr, &args->maux->ntmp_arr, rule->type);
     if ( ret<=0 )
         error("FIXME: error parsing %s at %s:%d .. %d\n", rule->hdr_tag,bcf_seqname(hdr,line),line->pos+1,ret);
-
     rule->nblocks++;
 
     if ( rule->type==BCF_HT_STR )
@@ -821,7 +837,7 @@ void normalize_alleles(char **als, int nals)
  * Here the mapping from the original $a alleles to the new $b alleles is 0->0,
  * 1->2, and 2->3.
  */
-char **merge_alleles(char **a, int na, int *map, char **b, int *nb, int *mb, int is_split_record)
+char **merge_alleles(char **a, int na, int *map, char **b, int *nb, int *mb, variant_t* var_types, int is_split_record)
 {
     // reference allele never changes
     map[0] = 0;
@@ -1352,6 +1368,9 @@ void merge_info(args_t *args, bcf1_t *out)
     khiter_t kitr;
     strdict_t *tmph = args->tmph;
     kh_clear(strdict, tmph);
+#else
+    args->m_idmap.m_merged_DP_info_idx = -1;
+    memset(args->m_idmap.m_DP_info_vals, -1, args->files->nreaders*sizeof(int));
 #endif
     maux_t *ma = args->maux;
     ma->nAGR_info = 0;
@@ -1383,13 +1402,16 @@ void merge_info(args_t *args, bcf1_t *out)
             ASSERT(bcf_hdr_idinfo_exists(out_hdr, BCF_HL_INFO, id));    //should be INFO field 
             const char* out_key = bcf_hdr_int2id(out_hdr, BCF_DT_ID, id);
             ASSERT(out_key && strcmp(out_key, key) == 0);       //same as this key
-#endif
+#endif //DEBUG
+            //is END info tag, but pos == end - don't add END tag
+            if(id == args->m_idmap.m_merged_END_info_id && bcf_get_end_point(line) == out->pos)
+                continue;
 #else  //USE_ID_MAP
             int id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, key);
             if ( id==-1 ) error("Error: The INFO field is not defined in the header: %s\n", key);
 
             kitr = kh_get(strdict, tmph, key);  // have we seen the tag in one of the readers?
-#endif //USE_ID_MAP
+#endif //USE_ID_MAP 
             int len = bcf_hdr_id2length(hdr,BCF_HL_INFO,inf->key);
             if ( args->nrules )
             {
@@ -1405,7 +1427,14 @@ void merge_info(args_t *args, bcf1_t *out)
                 {
                     ASSERT(strcmp(rule->hdr_tag, out_key) == 0);
                     maux1_t *als = ( len==BCF_VL_A || len==BCF_VL_G || len==BCF_VL_R ) ? &ma->d[i][0] : NULL;
-                    if ( info_rules_add_values(args, hdr, line, rule, als, len) ) continue;
+                    if ( info_rules_add_values(args, hdr, line, rule, als, len) )
+                    {
+#ifdef USE_ID_MAP
+                        if(id == args->m_idmap.m_merged_DP_info_id)     //is DP info field
+                            args->m_idmap.m_DP_info_vals[i] = ((int32_t*)(rule->vals))[rule->nvals-1];
+#endif
+                        continue;
+                    }
                 }
             }
 
@@ -1488,7 +1517,15 @@ void merge_info(args_t *args, bcf1_t *out)
     out->d.info = ma->inf;
     out->d.m_info = ma->minf;
     for (i=0; i<args->nrules; i++)
+    {
         args->rules[i].merger(args->out_hdr, out, &args->rules[i]);
+        //DP field was added by merger
+        if(args->rules[i].nvals && args->rules[i].merged_id == args->m_idmap.m_merged_DP_info_id)
+        {
+            args->m_idmap.m_merged_DP_info_idx = out->n_info-1;//last added
+            ASSERT(strcmp(bcf_hdr_int2id(out_hdr, BCF_DT_ID, out->d.info[args->m_idmap.m_merged_DP_info_idx].key),"DP") == 0);
+        }
+    }
     for (i=0; i<ma->nAGR_info; i++)
     {
         AGR_info_t *agr = &ma->AGR_info[i];
@@ -1616,6 +1653,8 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
 
     const char *key = NULL;
     int nsize = 0, length = BCF_VL_FIXED, type = -1;
+
+    int out_id = -1;
     for (i=0; i<files->nreaders; i++)
     {
         if ( !ma->has_line[i] ) continue;
@@ -1623,6 +1662,9 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
         if ( !key ) key = files->readers[i].processed_header->id[BCF_DT_ID][fmt_map[i]->id].key;
         type = fmt_map[i]->type;
         int length_descriptor = bcf_hdr_id2length(files->readers[i].processed_header, BCF_HL_FMT, fmt_map[i]->id);
+#ifdef USE_ID_MAP
+        out_id = args->m_idmap.m_readers_map[i].m_id_2_merged_id[fmt_map[i]->id];
+#endif
         if ( IS_VL_G(files->readers[i].processed_header, fmt_map[i]->id) )
         { 
             length = BCF_VL_G; 
@@ -1832,6 +1874,91 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
         bcf_update_format_int32(out_hdr, out, key, (int32_t*)ma->tmp_arr, nsamples*nsize);
 }
 
+#ifdef USE_ID_MAP
+void update_DP_info(args_t* args, bcf1_t* out)
+{
+    //DP was added as an INFO field in this line
+    if(g_do_gatk_merge && args->m_idmap.m_merged_DP_info_idx >= 0)
+    {
+        int32_t* info_ptr = args->m_idmap.m_DP_info_vals;
+        int32_t sum = 0;
+        int i = 0;
+        int j = 0;
+        int k = 0;
+
+#define BRANCH(MIN_DP_type_t, DP_type_t, is_missing_MIN_DP, is_terminator_MIN_DP, is_missing_DP, is_terminator_DP) \
+        { \
+            MIN_DP_type_t* format_MIN_DP_ptr = (args->m_idmap.m_merged_MIN_DP_format_idx >= 0) ? \
+                (MIN_DP_type_t*)(out->d.fmt[args->m_idmap.m_merged_MIN_DP_format_idx].p) : 0; \
+            DP_type_t* format_DP_ptr = (args->m_idmap.m_merged_DP_format_idx >= 0) ? \
+                (DP_type_t*)(out->d.fmt[args->m_idmap.m_merged_DP_format_idx].p) : 0; \
+            for(i=0;i<args->files->nreaders;++i) \
+            { \
+                int local_nsamples = bcf_hdr_nsamples(args->files->readers[i].processed_header); \
+                if(info_ptr[i] < 0)    /*INFO field DP missing, use value from FORMAT field*/ \
+                { \
+                    int32_t local_sum = 0; /*Compute mean over DP values in FORMAT fields*/ \
+                    for(j=0;j<local_nsamples;++j) \
+                    { \
+                        if(format_MIN_DP_ptr == 0 || is_missing_MIN_DP || is_terminator_MIN_DP) \
+                            if(format_DP_ptr == 0 || is_missing_DP || is_terminator_DP) \
+                                continue; \
+                            else \
+                                local_sum += (int32_t)(format_DP_ptr[k+j]); \
+                        else \
+                            local_sum += (int32_t)(format_MIN_DP_ptr[k+j]); \
+                    } \
+                    sum += (local_sum/local_nsamples); \
+                } \
+                else \
+                    sum += info_ptr[i]; \
+                k += local_nsamples; \
+            } \
+        }
+        int MIN_DP_type = (args->m_idmap.m_merged_MIN_DP_format_idx >= 0) ?
+            out->d.fmt[args->m_idmap.m_merged_MIN_DP_format_idx].type : BCF_BT_INT32;
+        int DP_type = (args->m_idmap.m_merged_DP_format_idx >= 0) ?
+            out->d.fmt[args->m_idmap.m_merged_DP_format_idx].type : BCF_BT_INT32;
+        //need to consider all combinations of MIN_DP_type, DP_type - this is as good as any
+        switch(MIN_DP_type << 16 | DP_type)
+        {
+            case ((BCF_BT_INT8 << 16) | BCF_BT_INT8):
+                BRANCH(int8_t, int8_t, (format_MIN_DP_ptr[k+j] == bcf_int8_missing), (format_MIN_DP_ptr[k+j] == bcf_int8_vector_end), (format_DP_ptr[k+j] == bcf_int8_missing), (format_DP_ptr[k+j] == bcf_int8_vector_end));
+                break;
+            case ((BCF_BT_INT8 << 16) | BCF_BT_INT16):
+                BRANCH(int8_t, int16_t, (format_MIN_DP_ptr[k+j] == bcf_int8_missing), (format_MIN_DP_ptr[k+j] == bcf_int8_vector_end), (format_DP_ptr[k+j] == bcf_int16_missing), (format_DP_ptr[k+j] == bcf_int16_vector_end));
+                break;
+            case ((BCF_BT_INT8 << 16) | BCF_BT_INT32):
+                BRANCH(int8_t, int32_t, (format_MIN_DP_ptr[k+j] == bcf_int8_missing), (format_MIN_DP_ptr[k+j] == bcf_int8_vector_end), (format_DP_ptr[k+j] == bcf_int32_missing), (format_DP_ptr[k+j] == bcf_int32_vector_end));
+                break;
+            case ((BCF_BT_INT16 << 16) | BCF_BT_INT8):
+                BRANCH(int16_t, int8_t, (format_MIN_DP_ptr[k+j] == bcf_int16_missing), (format_MIN_DP_ptr[k+j] == bcf_int16_vector_end), (format_DP_ptr[k+j] == bcf_int8_missing), (format_DP_ptr[k+j] == bcf_int8_vector_end));
+                break;
+            case ((BCF_BT_INT16 << 16) | BCF_BT_INT16):
+                BRANCH(int16_t, int16_t, (format_MIN_DP_ptr[k+j] == bcf_int16_missing), (format_MIN_DP_ptr[k+j] == bcf_int16_vector_end), (format_DP_ptr[k+j] == bcf_int16_missing), (format_DP_ptr[k+j] == bcf_int16_vector_end));
+                break;
+            case ((BCF_BT_INT16 << 16) | BCF_BT_INT32):
+                BRANCH(int16_t, int32_t, (format_MIN_DP_ptr[k+j] == bcf_int16_missing), (format_MIN_DP_ptr[k+j] == bcf_int16_vector_end), (format_DP_ptr[k+j] == bcf_int32_missing), (format_DP_ptr[k+j] == bcf_int32_vector_end));
+                break;
+            case ((BCF_BT_INT32 << 16) | BCF_BT_INT8):
+                BRANCH(int32_t, int8_t, (format_MIN_DP_ptr[k+j] == bcf_int32_missing), (format_MIN_DP_ptr[k+j] == bcf_int32_vector_end), (format_DP_ptr[k+j] == bcf_int8_missing), (format_DP_ptr[k+j] == bcf_int8_vector_end));
+                break;
+            case ((BCF_BT_INT32 << 16) | BCF_BT_INT16):
+                BRANCH(int32_t, int16_t, (format_MIN_DP_ptr[k+j] == bcf_int32_missing), (format_MIN_DP_ptr[k+j] == bcf_int32_vector_end), (format_DP_ptr[k+j] == bcf_int16_missing), (format_DP_ptr[k+j] == bcf_int16_vector_end));
+                break;
+            case ((BCF_BT_INT32 << 16) | BCF_BT_INT32):
+                BRANCH(int32_t, int32_t, (format_MIN_DP_ptr[k+j] == bcf_int32_missing), (format_MIN_DP_ptr[k+j] == bcf_int32_vector_end), (format_DP_ptr[k+j] == bcf_int32_missing), (format_DP_ptr[k+j] == bcf_int32_vector_end));
+                break;
+            default:
+                assert(0);
+        }
+#undef BRANCH
+        ASSERT(args->m_idmap.m_merged_DP_info_idx >= 0 && args->m_idmap.m_merged_DP_info_idx < out->n_info);
+        out->d.info[args->m_idmap.m_merged_DP_info_idx].v1.i = sum;
+    }
+}
+#endif
+
 void merge_format(args_t *args, bcf1_t *out)
 {
     bcf_srs_t *files = args->files;
@@ -1852,6 +1979,9 @@ void merge_format(args_t *args, bcf1_t *out)
     strdict_t *tmph = args->tmph;
     kh_clear(strdict, tmph);
     int ret = 0;
+#else
+    args->m_idmap.m_merged_DP_format_idx = -1;
+    args->m_idmap.m_merged_MIN_DP_format_idx = -1;
 #endif
     int i, j, has_GT = 0, max_ifmt = 0; // max fmt index
 
@@ -1896,6 +2026,13 @@ void merge_format(args_t *args, bcf1_t *out)
                 else
                 {
                     ifmt = ++max_ifmt;  //GT is fmt index 0
+#ifdef USE_ID_MAP
+                    if(out_id == args->m_idmap.m_merged_DP_format_id)
+                        args->m_idmap.m_merged_DP_format_idx = ifmt;
+                    else
+                        if(out_id == args->m_idmap.m_merged_MIN_DP_format_id)
+                            args->m_idmap.m_merged_MIN_DP_format_idx = ifmt;
+#endif
                     if ( max_ifmt >= ma->nfmt_map )
                     {
                         ma->fmt_map = (bcf_fmt_t**) realloc(ma->fmt_map, sizeof(bcf_fmt_t*)*(max_ifmt+1)*files->nreaders);
@@ -1923,16 +2060,18 @@ void merge_format(args_t *args, bcf1_t *out)
         merge_GT(args, ma->fmt_map, out);
     update_AN_AC(out_hdr, out);
 
+    //0 is GT field - already merged
+    for (i=1; i<=max_ifmt; i++)
+        merge_format_field(args, &ma->fmt_map[i*files->nreaders], out);
+    //bcftools and htslib clusterf***
     if ( out->d.info!=ma->inf )
     {
         // hacky, we rely on htslib internals: bcf_update_info() reallocated the info
         ma->inf  = out->d.info;
         ma->minf = out->d.m_info;
     }
+    update_DP_info(args, out);
 
-    //0 is GT field - already merged
-    for (i=1; i<=max_ifmt; i++)
-        merge_format_field(args, &ma->fmt_map[i*files->nreaders], out);
     out->d.indiv_dirty = 1;
 }
 
@@ -1950,6 +2089,11 @@ void merge_line(args_t *args)
     memset(args->m_idmap.m_merged_id_2_merged_idx, -1, args->m_idmap.m_num_merged_ids*sizeof(int));
 #endif
     merge_info(args, out);
+#ifdef USE_ID_MAP
+    //since same ID may be FORMAT also
+    //map from id in merged hdr to index in merged bcf1_t* out : initialize to -1
+    memset(args->m_idmap.m_merged_id_2_merged_idx, -1, args->m_idmap.m_num_merged_ids*sizeof(int));
+#endif
     merge_format(args, out);
 
     bcf_write1(args->out_fh, args->out_hdr, out);
@@ -2711,7 +2855,7 @@ void merge_buffer(args_t *args)
             }
 
             // normalize alleles
-            maux->als = merge_alleles(line->d.allele, line->n_allele, maux->d[i][j].map, maux->als, &maux->nals, &maux->mals, line->m_is_split_record);
+            maux->als = merge_alleles(line->d.allele, line->n_allele, maux->d[i][j].map, maux->als, &maux->nals, &maux->mals, line->d.var, line->m_is_split_record);
             if ( !maux->als ) error("Failed to merge alleles at %s:%d\n",bcf_seqname(args->out_hdr,line),line->pos+1);
             hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
             for (k=1; k<line->n_allele; k++)
@@ -3025,6 +3169,7 @@ void setup_idmap(args_t* args)
     //map from id in merged hdr to info_rule index
     args->m_idmap.m_merged_id_2_info_rule_idx = (int*)malloc(args->m_idmap.m_num_merged_ids*sizeof(int));
     memset(args->m_idmap.m_merged_id_2_info_rule_idx, -1, args->m_idmap.m_num_merged_ids*sizeof(int));
+    args->m_idmap.m_DP_info_vals = (int*)malloc(args->files->nreaders*sizeof(int));
     for(i=0;i<args->files->nreaders;++i)
     {
         //map from merged ids to ids of file i
@@ -3061,6 +3206,13 @@ void setup_idmap(args_t* args)
             curr_map->m_id_2_merged_id[j] = out_idx;
         }
     }
+    args->m_idmap.m_merged_DP_info_id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, "DP");
+    args->m_idmap.m_merged_DP_format_id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, "DP");
+    args->m_idmap.m_merged_MIN_DP_format_id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, "MIN_DP");
+    ASSERT(args->m_idmap.m_merged_DP_format_id == args->m_idmap.m_merged_DP_info_id);
+    ASSERT(args->m_idmap.m_merged_DP_info_id < 0 || bcf_hdr_idinfo_exists(out_hdr, BCF_HL_INFO, args->m_idmap.m_merged_DP_info_id));
+    ASSERT(args->m_idmap.m_merged_DP_info_id < 0 || bcf_hdr_idinfo_exists(out_hdr, BCF_HL_FMT, args->m_idmap.m_merged_DP_info_id));
+    args->m_idmap.m_merged_END_info_id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, "END");
 }
 
 void destroy_idmap(args_t* args)
@@ -3080,6 +3232,7 @@ void destroy_idmap(args_t* args)
         free(args->m_idmap.m_merged_id_2_reader_idmap);
         free(args->m_idmap.m_merged_id_2_merged_idx);
         free(args->m_idmap.m_merged_id_2_info_rule_idx);
+        free(args->m_idmap.m_DP_info_vals);
     }
 }
 
