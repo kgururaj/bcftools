@@ -837,7 +837,7 @@ void normalize_alleles(char **als, int nals)
  * Here the mapping from the original $a alleles to the new $b alleles is 0->0,
  * 1->2, and 2->3.
  */
-char **merge_alleles(char **a, int na, int *map, char **b, int *nb, int *mb, variant_t* var_types, int is_split_record)
+char **merge_alleles(char **a, int na, int *map, char **b, int *nb, int *mb, variant_t* var_types, int* contains_non_ref, int is_split_record)
 {
     // reference allele never changes
     map[0] = 0;
@@ -914,6 +914,13 @@ char **merge_alleles(char **a, int na, int *map, char **b, int *nb, int *mb, var
         }
         else
             ai = a[i];
+
+        //handle NON_REFs later to ensure it's always the last of the list
+        if(var_types[i].type & VCF_NON_REF)
+        {
+            *contains_non_ref = 1;
+            continue;
+        }
 
         for (j=1; j<*nb; j++)
             if ( !strcmp(ai,b[j]) ) break;
@@ -2793,6 +2800,7 @@ void merge_buffer(args_t *args)
         }
     }
 
+    int contains_non_ref = 0;
     // In this loop we select from each reader compatible candidate lines.
     // (i.e. SNPs or indels). Go through all files and all lines at this
     // position and normalize relevant alleles.
@@ -2841,29 +2849,70 @@ void merge_buffer(args_t *args)
             hts_expand(int, line->n_allele, maux->d[i][j].mmap, maux->d[i][j].map);
             if ( !maux->nals )    // first record, copy the alleles to the output
             {
-                maux->nals = line->n_allele;
-                hts_expand0(char*, maux->nals, maux->mals, maux->als);
-                hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
-                for (k=0; k<maux->nals; k++)
+                maux->nals = 0;
+                hts_expand0(char*, line->n_allele, maux->mals, maux->als);
+                hts_expand0(int, line->n_allele, maux->ncnt, maux->cnt);
+                for (k=0; k<line->n_allele; k++)
                 {
-                    maux->als[k] = strdup(line->d.allele[k]);
-                    maux->d[i][j].map[k] = k;
-                    maux->cnt[k] = 1;
+                    //NON_REFS will be added at the end
+                    if(line->d.var[k].type & VCF_NON_REF)
+                    {
+                        contains_non_ref = 1;
+                        continue;
+                    }
+                    maux->als[maux->nals] = strdup(line->d.allele[k]);
+                    maux->d[i][j].map[k] = maux->nals;
+                    maux->cnt[maux->nals] = 1;
+                    ++(maux->nals);
                 }
                 pos = line->pos;
                 continue;
             }
 
             // normalize alleles
-            maux->als = merge_alleles(line->d.allele, line->n_allele, maux->d[i][j].map, maux->als, &maux->nals, &maux->mals, line->d.var, line->m_is_split_record);
+            maux->als = merge_alleles(line->d.allele, line->n_allele, maux->d[i][j].map, maux->als, &maux->nals, &maux->mals,
+                    line->d.var, &contains_non_ref, line->m_is_split_record);
             if ( !maux->als ) error("Failed to merge alleles at %s:%d\n",bcf_seqname(args->out_hdr,line),line->pos+1);
             hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
             for (k=1; k<line->n_allele; k++)
+            {
+                if(line->d.var[k].type & VCF_NON_REF)
+                    continue;
                 maux->cnt[ maux->d[i][j].map[k] ]++;    // how many times an allele appears in the files
+            }
             maux->cnt[0]++;
         }
     }
-
+    //Add NON_REF variant at the end
+    if(contains_non_ref)
+    {
+        ++(maux->nals);
+        hts_expand0(char*, maux->nals, maux->mals, maux->als);
+        hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
+        int non_ref_idx = maux->nals - 1;
+        maux->als[non_ref_idx] = strdup("<NON_REF>"); 
+        for (i=0; i<files->nreaders; i++)
+        {
+            bcf_sr_t *reader = &files->readers[i];
+            if ( !reader->buffer ) continue;
+            int j, k;
+            for (j=0; j<=reader->nbuffer; j++)
+            {
+                bcf1_t *line = reader->buffer[j];
+                if ( pos!=line->pos || maux->d[i][j].skip ) 
+                    continue;
+                //don't bother with reference allele
+                for (k=1; k<line->n_allele; k++)
+                {
+                    if(line->d.var[k].type & VCF_NON_REF)
+                    {
+                        maux->d[i][j].map[k] = non_ref_idx;
+                        ++(maux->cnt[non_ref_idx]);
+                    }
+                }
+            }
+        }
+    }
     // debug_maux(args, pos, var_type);
 
     // Select records that have the same alleles; the input ordering of indels
