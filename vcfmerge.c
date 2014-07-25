@@ -2716,7 +2716,6 @@ void align_to_end(args_t* args, int new_end_point, int chrom_idx, const char* re
 void merge_buffer(args_t *args)
 {
     bcf_srs_t *files = args->files;
-    int i, pos = -1, var_type = 0;
     char *id = NULL;
     maux_t *maux = args->maux;
     //Same buffer could produce lots of lines for gVCFs
