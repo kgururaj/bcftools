@@ -137,6 +137,8 @@ typedef struct
     //Map from original to preprocessed if the field needs to be copied somewhere else
     int* m_original_id_2_preprocessed_copy_id;
     int m_num_original_ids;
+    //GQ id
+    int m_GQ_id;
 }reader_idmap;
 
 typedef struct
@@ -160,9 +162,10 @@ typedef struct
     int m_merged_MIN_DP_format_id;
     //index vs/ id
     int m_merged_MIN_DP_format_idx;
-
     //END id
     int m_merged_END_info_id;
+    //flag whether merged line has only 1 variant of type NON_REF
+    int m_merged_has_only_non_ref;
 }idmap;
 
 typedef struct
@@ -1103,6 +1106,12 @@ void merge_chrom2qual(args_t *args, bcf1_t *out)
     assert( k==ma->nout_als );
     normalize_alleles(ma->out_als, ma->nout_als);
     bcf_update_alleles(out_hdr, out, (const char**) ma->out_als, ma->nout_als);
+#ifdef USE_ID_MAP
+    if(out->n_allele == 2 && out->d.var[1].type & VCF_NON_REF)
+        args->m_idmap.m_merged_has_only_non_ref = 1;
+    else
+        args->m_idmap.m_merged_has_only_non_ref = 0;
+#endif
     free(al_idxs);
     for (i=0; i<ma->nout_als; i++) free(ma->out_als[i]);
 }
@@ -2010,6 +2019,9 @@ void merge_format(args_t *args, bcf1_t *out)
                 continue;
             const char *key = hdr->id[BCF_DT_ID][fmt->id].key;
 #ifdef USE_ID_MAP
+            //For lines with variants other than NON_REF, GQ format field is dropped
+            if(g_do_gatk_merge && !(args->m_idmap.m_merged_has_only_non_ref) && fmt->id == curr_map->m_GQ_id)
+                continue;
             ASSERT(fmt->id < curr_map->m_num_ids);
             int out_id = curr_map->m_id_2_merged_id[fmt->id];
             ASSERT(out_id >= 0 && out_id < out_hdr->n[BCF_DT_ID] && out_id < args->m_idmap.m_num_merged_ids);
@@ -3230,6 +3242,7 @@ void setup_idmap(args_t* args)
         reader_idmap* curr_map = &(args->m_idmap.m_readers_map[i]); 
         curr_map->m_num_ids = curr_hdr->n[BCF_DT_ID];
         curr_map->m_id_2_merged_id = (int*)malloc(curr_hdr->n[BCF_DT_ID]*sizeof(int));
+        curr_map->m_GQ_id = bcf_hdr_id2int(curr_hdr, BCF_DT_ID, "GQ");
         for(j=0;j<curr_hdr->n[BCF_DT_ID];++j)
         {
             bcf_idpair_t* curr_id = &(curr_hdr->id[BCF_DT_ID][j]);

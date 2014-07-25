@@ -36,6 +36,7 @@ int main_vcfindex(int argc, char *argv[]);
 int main_vcfstats(int argc, char *argv[]);
 int main_vcfisec(int argc, char *argv[]);
 int main_vcfmerge(int argc, char *argv[]);
+int main_vcfdiff(int argc, char *argv[]);
 int main_vcfquery(int argc, char *argv[]);
 int main_vcffilter(int argc, char *argv[]);
 int main_vcfsom(int argc, char *argv[]);
@@ -102,7 +103,11 @@ static cmd_t cmds[] =
       .alias = "merge",
       .help  = "merge VCF/BCF files files from non-overlapping sample sets"
     },
-    { .func  = main_vcfnorm,
+    { .func  = main_vcfdiff, 
+      .alias = "diff",
+      .help  = "diff 2 VCF/BCF files"
+    },
+    { .func  = main_vcfnorm, 
       .alias = "norm",
       .help  = "left-align and normalize indels"
     },
