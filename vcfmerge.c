@@ -203,11 +203,11 @@ args_t;
 #include "gperftools/profiler.h"
 #endif
 
+kstring_t g_debug_string = { 0, 0, 0 };
 #ifdef DEBUG
 #define ASSERT(X)  assert(X)
 FILE* g_debug_fptr = 0;
 FILE* g_vcf_debug_fptr = 0;
-kstring_t g_debug_string = { 0, 0, 0 };
 #else
 #define ASSERT(X) ;
 #endif

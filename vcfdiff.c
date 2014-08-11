@@ -658,18 +658,20 @@ int main_vcfdiff(int argc, char *argv[])
             int num_gts = (num_alleles*(num_alleles+1))/2;
             REALLOC_IF_NEEDED(curr_map->m_gt_map, curr_map->m_gt_map_size, num_gts, int);
             memset(curr_map->m_gt_map, -1, curr_map->m_gt_map_size*sizeof(int));
-            //CHROM 2 qual
+            //chrom
             if(curr_map->m_contig_map[curr_line->rid] != first_line->rid)
             {
                 print_lines(first_file, curr_file, 0, i);
                 printf("Different CHROM values\n");
             }
+            //pos
             if(curr_line->pos != first_line->pos)
             {
                 print_lines(first_file, curr_file, 0, i);
                 printf("Different POS values\n");
             }
             //ignoring ID column
+            //qual
             if(!(bcf_float_is_missing(curr_line->qual) && bcf_float_is_missing(first_line->qual))
                     && curr_line->qual != first_line->qual)
             {
