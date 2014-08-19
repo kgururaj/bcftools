@@ -215,6 +215,7 @@ unsigned g_preprocess_vcfs = 0;
 unsigned g_is_input_gvcf = 0;
 unsigned g_do_gatk_merge = 0;
 const char* g_info2format_suffix = "_INFO";
+unsigned g_measure_iterator_timing_only = 0;
 
 //Merge configuration
 enum MergeActionEnum
@@ -2810,206 +2811,225 @@ void merge_buffer(args_t *args)
             break;
         }
     }
-
-    int contains_non_ref = 0;
-    // In this loop we select from each reader compatible candidate lines.
-    // (i.e. SNPs or indels). Go through all files and all lines at this
-    // position and normalize relevant alleles.
-    // REF-only sites may be associated with both SNPs and indels.
-    for (i=0; i<files->nreaders; i++)
+    if(g_measure_iterator_timing_only)
     {
-        bcf_sr_t *reader = &files->readers[i];
-        if ( !reader->buffer ) continue;
-        int j, k;
-        for (j=0; j<=reader->nbuffer; j++)
+        for (i=0; i<files->nreaders; i++)
         {
-            bcf1_t *line = reader->buffer[j];
-            int line_type = bcf_get_variant_types(line);
-
-            // select relevant lines
-            maux->d[i][j].skip = SKIP_DIFF;
-            if ( pos!=line->pos )
+            bcf_sr_t *reader = &files->readers[i];
+            if ( !reader->buffer ) continue;
+            int j = 0;
+            for (j=0; j<=reader->nbuffer; j++)  
             {
-                if ( j==0 ) maux->d[i][j].skip |= SKIP_DONE; // left from previous run, force to ignore
-                continue;
+                bcf1_t *line = reader->buffer[j];
+                if(line->pos == pos)
+                    maux->d[i][j].skip |= SKIP_DONE;
+                else
+                    break;
             }
-            if ( args->merge_by_id )
-            {
-                if ( strcmp(id,line->d.id) ) continue;
-            }
-            else
-            {
-                if ( args->collapse==COLLAPSE_NONE && maux->nals )
-                {
-                    // All alleles of the tested record must be present in the
-                    // selected maux record plus variant types must be the same
-                    if ( var_type!=line->d.var_type ) continue;
-                    if ( vcmp_set_ref(args->vcmp,maux->als[0],line->d.allele[0]) < 0 ) continue;   // refs not compatible
-                    for (k=1; k<line->n_allele; k++)
-                    {
-                        if ( vcmp_find_allele(args->vcmp,maux->als+1,maux->nals-1,line->d.allele[k])>=0 ) break;
-                    }
-                    if ( k==line->n_allele ) continue;  // no matching allele
-                }
-                if ( var_type&VCF_SNP && !(line_type&VCF_SNP) && !(args->collapse&COLLAPSE_ANY) && line_type!=VCF_REF ) continue;
-                if ( var_type&VCF_INDEL && !(line_type&VCF_INDEL) && !(args->collapse&COLLAPSE_ANY) && line_type!=VCF_REF ) continue;
-            }
-            maux->d[i][j].skip = 0;
-
-            //realloc
-            hts_expand(int, line->n_allele, maux->d[i][j].mmap, maux->d[i][j].map);
-            if ( !maux->nals )    // first record, copy the alleles to the output
-            {
-                maux->nals = 0;
-                hts_expand0(char*, line->n_allele, maux->mals, maux->als);
-                hts_expand0(int, line->n_allele, maux->ncnt, maux->cnt);
-                for (k=0; k<line->n_allele; k++)
-                {
-                    //NON_REFS will be added at the end
-                    if(line->d.var[k].type & VCF_NON_REF)
-                    {
-                        contains_non_ref = 1;
-                        continue;
-                    }
-                    maux->als[maux->nals] = strdup(line->d.allele[k]);
-                    maux->d[i][j].map[k] = maux->nals;
-                    maux->cnt[maux->nals] = 1;
-                    ++(maux->nals);
-                }
-                pos = line->pos;
-                continue;
-            }
-
-            // normalize alleles
-            maux->als = merge_alleles(line->d.allele, line->n_allele, maux->d[i][j].map, maux->als, &maux->nals, &maux->mals,
-                    line->d.var, &contains_non_ref, line->m_is_split_record);
-            if ( !maux->als ) error("Failed to merge alleles at %s:%d\n",bcf_seqname(args->out_hdr,line),line->pos+1);
-            hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
-            for (k=1; k<line->n_allele; k++)
-            {
-                if(line->d.var[k].type & VCF_NON_REF)
-                    continue;
-                maux->cnt[ maux->d[i][j].map[k] ]++;    // how many times an allele appears in the files
-            }
-            maux->cnt[0]++;
         }
     }
-    //Add NON_REF variant at the end
-    if(contains_non_ref)
+    else
     {
-        ++(maux->nals);
-        hts_expand0(char*, maux->nals, maux->mals, maux->als);
-        hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
-        int non_ref_idx = maux->nals - 1;
-        maux->als[non_ref_idx] = strdup("<NON_REF>"); 
+        int contains_non_ref = 0;
+        // In this loop we select from each reader compatible candidate lines.
+        // (i.e. SNPs or indels). Go through all files and all lines at this
+        // position and normalize relevant alleles.
+        // REF-only sites may be associated with both SNPs and indels.
         for (i=0; i<files->nreaders; i++)
         {
             bcf_sr_t *reader = &files->readers[i];
             if ( !reader->buffer ) continue;
             int j, k;
-            for (j=0; j<=reader->nbuffer; j++)
+            for (j=0; j<=reader->nbuffer; j++)  
             {
                 bcf1_t *line = reader->buffer[j];
-                if ( pos!=line->pos || maux->d[i][j].skip ) 
+                int line_type = bcf_get_variant_types(line);
+
+                // select relevant lines
+                maux->d[i][j].skip = SKIP_DIFF;
+                if ( pos!=line->pos ) 
+                {
+                    if ( j==0 ) maux->d[i][j].skip |= SKIP_DONE; // left from previous run, force to ignore
+                    continue; 
+                }
+                if ( args->merge_by_id )
+                {
+                    if ( strcmp(id,line->d.id) ) continue;
+                }
+                else
+                {
+                    if ( args->collapse==COLLAPSE_NONE && maux->nals )
+                    {
+                        // All alleles of the tested record must be present in the
+                        // selected maux record plus variant types must be the same
+                        if ( var_type!=line->d.var_type ) continue;
+                        if ( vcmp_set_ref(args->vcmp,maux->als[0],line->d.allele[0]) < 0 ) continue;   // refs not compatible
+                        for (k=1; k<line->n_allele; k++)
+                        {
+                            if ( vcmp_find_allele(args->vcmp,maux->als+1,maux->nals-1,line->d.allele[k])>=0 ) break;
+                        }
+                        if ( k==line->n_allele ) continue;  // no matching allele
+                    }
+                    if ( var_type&VCF_SNP && !(line_type&VCF_SNP) && !(args->collapse&COLLAPSE_ANY) && line_type!=VCF_REF ) continue;
+                    if ( var_type&VCF_INDEL && !(line_type&VCF_INDEL) && !(args->collapse&COLLAPSE_ANY) && line_type!=VCF_REF ) continue;
+                }
+                maux->d[i][j].skip = 0;
+
+                //realloc
+                hts_expand(int, line->n_allele, maux->d[i][j].mmap, maux->d[i][j].map);
+                if ( !maux->nals )    // first record, copy the alleles to the output
+                {
+                    maux->nals = 0;
+                    hts_expand0(char*, line->n_allele, maux->mals, maux->als);
+                    hts_expand0(int, line->n_allele, maux->ncnt, maux->cnt);
+                    for (k=0; k<line->n_allele; k++)
+                    {
+                        //NON_REFS will be added at the end
+                        if(line->d.var[k].type & VCF_NON_REF)
+                        {
+                            contains_non_ref = 1;
+                            continue;
+                        }
+                        maux->als[maux->nals] = strdup(line->d.allele[k]);
+                        maux->d[i][j].map[k] = maux->nals;
+                        maux->cnt[maux->nals] = 1;
+                        ++(maux->nals);
+                    }
+                    pos = line->pos;
                     continue;
-                //don't bother with reference allele
+                }
+
+                // normalize alleles
+                maux->als = merge_alleles(line->d.allele, line->n_allele, maux->d[i][j].map, maux->als, &maux->nals, &maux->mals,
+                        line->d.var, &contains_non_ref, line->m_is_split_record);
+                if ( !maux->als ) error("Failed to merge alleles at %s:%d\n",bcf_seqname(args->out_hdr,line),line->pos+1);
+                hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
                 for (k=1; k<line->n_allele; k++)
                 {
                     if(line->d.var[k].type & VCF_NON_REF)
+                        continue;
+                    maux->cnt[ maux->d[i][j].map[k] ]++;    // how many times an allele appears in the files
+                }
+                maux->cnt[0]++;
+            }
+        }
+        //Add NON_REF variant at the end
+        if(contains_non_ref)
+        {
+            ++(maux->nals);
+            hts_expand0(char*, maux->nals, maux->mals, maux->als);
+            hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
+            int non_ref_idx = maux->nals - 1;
+            maux->als[non_ref_idx] = strdup("<NON_REF>"); 
+            for (i=0; i<files->nreaders; i++)
+            {
+                bcf_sr_t *reader = &files->readers[i];
+                if ( !reader->buffer ) continue;
+                int j, k;
+                for (j=0; j<=reader->nbuffer; j++)
+                {
+                    bcf1_t *line = reader->buffer[j];
+                    if ( pos!=line->pos || maux->d[i][j].skip ) 
+                        continue;
+                    //don't bother with reference allele
+                    for (k=1; k<line->n_allele; k++)
                     {
-                        maux->d[i][j].map[k] = non_ref_idx;
-                        ++(maux->cnt[non_ref_idx]);
+                        if(line->d.var[k].type & VCF_NON_REF)
+                        {
+                            maux->d[i][j].map[k] = non_ref_idx;
+                            ++(maux->cnt[non_ref_idx]);
+                        }
                     }
                 }
             }
         }
-    }
-    // debug_maux(args, pos, var_type);
+        // debug_maux(args, pos, var_type);
 
-    // Select records that have the same alleles; the input ordering of indels
-    // must not matter. Multiple VCF lines can be emitted from this loop.
-    // We expect only very few alleles and not many records with the same
-    // position in the buffers, therefore the nested loops should not slow us
-    // much.
-    while (1)
-    {
-        // take the most frequent allele present in multiple files
-        int icnt = 0;
-        for (i=1; i<maux->nals; i++)
-            if ( maux->cnt[i] > maux->cnt[icnt] ) icnt = i;
-        if ( maux->cnt[icnt]<0 ) break;
-
-        int nmask = 0;
-        for (i=0; i<files->nreaders; i++)
+        // Select records that have the same alleles; the input ordering of indels
+        // must not matter. Multiple VCF lines can be emitted from this loop.
+        // We expect only very few alleles and not many records with the same
+        // position in the buffers, therefore the nested loops should not slow us
+        // much.
+        while (1)
         {
-            maux->has_line[i] = 0;
+            // take the most frequent allele present in multiple files
+            int icnt = 0;
+            for (i=1; i<maux->nals; i++) 
+                if ( maux->cnt[i] > maux->cnt[icnt] ) icnt = i;
+            if ( maux->cnt[icnt]<0 ) break;
 
-            bcf_sr_t *reader = &files->readers[i];
-            if ( !reader->buffer ) continue;
-
-            // find lines with the same allele
-            int j;
-            for (j=0; j<=reader->nbuffer; j++)
+            int nmask = 0;
+            for (i=0; i<files->nreaders; i++)
             {
-                if ( maux->d[i][j].skip ) continue;
-                int k;
-                for (k=0; k<reader->buffer[j]->n_allele; k++)
-                    if ( icnt==maux->d[i][j].map[k] ) break;
-                if ( k<reader->buffer[j]->n_allele ) break;
-            }
-            if ( j>reader->nbuffer )
-            {
-                // no matching allele found in this file
-                if ( args->collapse==COLLAPSE_NONE ) continue;
+                maux->has_line[i] = 0;
 
+                bcf_sr_t *reader = &files->readers[i];
+                if ( !reader->buffer ) continue;
+
+                // find lines with the same allele
+                int j;
                 for (j=0; j<=reader->nbuffer; j++)
                 {
                     if ( maux->d[i][j].skip ) continue;
-                    if ( args->collapse&COLLAPSE_ANY ) break;
-                    int line_type = bcf_get_variant_types(reader->buffer[j]);
-                    if ( var_type&VCF_SNP && line_type&VCF_SNP && (args->collapse&COLLAPSE_SNPS) ) break;
-                    if ( var_type&VCF_INDEL && line_type&VCF_INDEL && (args->collapse&COLLAPSE_INDELS) ) break;
-                    if ( line_type==VCF_REF )
-                    {
-                        if ( var_type&VCF_SNP && (args->collapse&COLLAPSE_SNPS) ) break;
-                        if ( var_type&VCF_INDEL && (args->collapse&COLLAPSE_INDELS) ) break;
-                    }
-                    else if ( var_type==VCF_REF )
-                    {
-                        if ( line_type&VCF_SNP && (args->collapse&COLLAPSE_SNPS) ) break;
-                        if ( line_type&VCF_INDEL && (args->collapse&COLLAPSE_INDELS) ) break;
-                    }
+                    int k;
+                    for (k=0; k<reader->buffer[j]->n_allele; k++)
+                        if ( icnt==maux->d[i][j].map[k] ) break;
+                    if ( k<reader->buffer[j]->n_allele ) break;
                 }
-            }
-            if ( j<=reader->nbuffer )
-            {
-                // found a suitable line for merging, place it at the beggining
-                if ( j>0 )
+                if ( j>reader->nbuffer )
                 {
-                    SWAP(bcf1_t*, reader->buffer[0], reader->buffer[j]);
-                    SWAP(maux1_t, maux->d[i][0], maux->d[i][j]);
-                }
-                // mark as finished so that it's ignored next time
-                maux->d[i][0].skip |= SKIP_DONE;
-                maux->has_line[i] = 1;
-                nmask++;
-            }
-        }
-        if ( !nmask ) break;    // done, no more lines suitable for merging found 
-#ifdef COLLECT_STATS
-        update_stat(args, NUM_ACTIVE_SAMPLES_PER_LINE, nmask);
-#endif
-        merge_line(args);       // merge and output the line
-        maux->cnt[icnt] = -1;   // do not pick this allele again, mark it as finished
-    }
+                    // no matching allele found in this file 
+                    if ( args->collapse==COLLAPSE_NONE ) continue;
 
-    // clean the alleles
-    for (i=0; i<maux->nals; i++)
-    {
-        free(maux->als[i]);
-        maux->als[i] = 0;
+                    for (j=0; j<=reader->nbuffer; j++)
+                    {
+                        if ( maux->d[i][j].skip ) continue;
+                        if ( args->collapse&COLLAPSE_ANY ) break;
+                        int line_type = bcf_get_variant_types(reader->buffer[j]);
+                        if ( var_type&VCF_SNP && line_type&VCF_SNP && (args->collapse&COLLAPSE_SNPS) ) break;
+                        if ( var_type&VCF_INDEL && line_type&VCF_INDEL && (args->collapse&COLLAPSE_INDELS) ) break;
+                        if ( line_type==VCF_REF )
+                        {
+                            if ( var_type&VCF_SNP && (args->collapse&COLLAPSE_SNPS) ) break;
+                            if ( var_type&VCF_INDEL && (args->collapse&COLLAPSE_INDELS) ) break;
+                        }
+                        else if ( var_type==VCF_REF )
+                        {
+                            if ( line_type&VCF_SNP && (args->collapse&COLLAPSE_SNPS) ) break;
+                            if ( line_type&VCF_INDEL && (args->collapse&COLLAPSE_INDELS) ) break;
+                        }
+                    }
+                }
+                if ( j<=reader->nbuffer ) 
+                {
+                    // found a suitable line for merging, place it at the beggining
+                    if ( j>0 ) 
+                    {
+                        SWAP(bcf1_t*, reader->buffer[0], reader->buffer[j]); 
+                        SWAP(maux1_t, maux->d[i][0], maux->d[i][j]); 
+                    }
+                    // mark as finished so that it's ignored next time
+                    maux->d[i][0].skip |= SKIP_DONE;
+                    maux->has_line[i] = 1;
+                    nmask++;
+                }
+            }
+            if ( !nmask ) break;    // done, no more lines suitable for merging found 
+#ifdef COLLECT_STATS
+            update_stat(args, NUM_ACTIVE_SAMPLES_PER_LINE, nmask);
+#endif
+            merge_line(args);       // merge and output the line
+            maux->cnt[icnt] = -1;   // do not pick this allele again, mark it as finished
+        }
+
+        // clean the alleles
+        for (i=0; i<maux->nals; i++)
+        {
+            free(maux->als[i]);
+            maux->als[i] = 0;
+        }
+        maux->nals = 0;
     }
-    maux->nals = 0;
 
     // get the buffers ready for the next next_line() call
     for (i=0; i<files->nreaders; i++)
@@ -3571,6 +3591,7 @@ enum ArgsIdxEnum
   ARGS_IDX_REFERENCE_FILE,
   ARGS_IDX_INPUT_GVCFS,
   ARGS_IDX_DO_GATK_MERGE,
+  ARGS_IDX_MEASURE_ITERATOR_TIMING,
   ARGS_IDX_TAG
 };
 
@@ -3610,6 +3631,7 @@ int main_vcfmerge(int argc, char *argv[])
         {"gvcf",0,0,ARGS_IDX_INPUT_GVCFS},
         {"tag",1,0,ARGS_IDX_TAG},
         {"gatk",0,0,ARGS_IDX_DO_GATK_MERGE},
+        {"iterator-timing",0,0,ARGS_IDX_MEASURE_ITERATOR_TIMING},
         {0,0,0,0}
     };
     while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:l:",loptions,NULL)) >= 0) {
@@ -3648,6 +3670,7 @@ int main_vcfmerge(int argc, char *argv[])
             case ARGS_IDX_INPUT_GVCFS: g_is_input_gvcf = 1; break;
             case ARGS_IDX_TAG:  args->m_tag = strdup(optarg); break;
             case ARGS_IDX_DO_GATK_MERGE: g_do_gatk_merge = 1; break;
+            case ARGS_IDX_MEASURE_ITERATOR_TIMING: g_measure_iterator_timing_only = 1; break;
             case 'h': 
             case '?': usage();
             default: error("Unknown argument: %s\n", optarg);
