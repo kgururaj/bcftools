@@ -168,6 +168,23 @@ typedef struct
     int m_merged_has_only_non_ref;
 }idmap;
 
+//calloc on args_t sets everything to 0
+typedef struct
+{
+    FILE* m_output_fptr;
+    int* m_median_result;
+    int m_median_result_len;
+    int* m_buffer;
+    int m_buffer_len;
+    int* m_reorg_buffer;
+    int m_reorg_buffer_len;
+}plmedian_struct;
+
+int compute_PLmedian(bcf_hdr_t* hdr, bcf1_t* line, int** median_result, int* median_result_len,
+        int** buffer, int* buffer_len,
+        int** reorg_buffer, int* reorg_buffer_len);
+void print_PLmedian(FILE* fptr, bcf_hdr_t* hdr, bcf1_t* line, int* median_result, int median_result_len);
+
 typedef struct
 {
     vcmp_t *vcmp;
@@ -196,6 +213,7 @@ typedef struct
     idmap m_idmap;
     char **argv;
     int argc;
+    plmedian_struct  m_plmedian_info;
 }
 args_t;
 
@@ -923,6 +941,7 @@ char **merge_alleles(char **a, int na, int *map, char **b, int *nb, int *mb, var
         if(var_types[i].type & VCF_NON_REF)
         {
             *contains_non_ref = 1;
+            if ( rlb>rla ) free(ai);
             continue;
         }
 
@@ -2117,6 +2136,15 @@ void merge_line(args_t *args)
     merge_format(args, out);
 
     bcf_write1(args->out_fh, args->out_hdr, out);
+    if(args->m_plmedian_info.m_output_fptr)
+    {
+        int veclen = compute_PLmedian(args->out_hdr, out,
+                &(args->m_plmedian_info.m_median_result), &(args->m_plmedian_info.m_median_result_len),
+                &(args->m_plmedian_info.m_buffer), &(args->m_plmedian_info.m_buffer_len),
+                &(args->m_plmedian_info.m_reorg_buffer), &(args->m_plmedian_info.m_reorg_buffer_len));
+        print_PLmedian(args->m_plmedian_info.m_output_fptr, args->out_hdr, out,
+                args->m_plmedian_info.m_median_result, veclen);
+    }
 }
 
 
@@ -3592,6 +3620,7 @@ enum ArgsIdxEnum
   ARGS_IDX_INPUT_GVCFS,
   ARGS_IDX_DO_GATK_MERGE,
   ARGS_IDX_MEASURE_ITERATOR_TIMING,
+  ARGS_IDX_COMPUTE_PLMEDIAN,
   ARGS_IDX_TAG
 };
 
@@ -3632,6 +3661,7 @@ int main_vcfmerge(int argc, char *argv[])
         {"tag",1,0,ARGS_IDX_TAG},
         {"gatk",0,0,ARGS_IDX_DO_GATK_MERGE},
         {"iterator-timing",0,0,ARGS_IDX_MEASURE_ITERATOR_TIMING},
+        {"PLmedian",1,0,ARGS_IDX_COMPUTE_PLMEDIAN},
         {0,0,0,0}
     };
     while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:l:",loptions,NULL)) >= 0) {
@@ -3671,6 +3701,7 @@ int main_vcfmerge(int argc, char *argv[])
             case ARGS_IDX_TAG:  args->m_tag = strdup(optarg); break;
             case ARGS_IDX_DO_GATK_MERGE: g_do_gatk_merge = 1; break;
             case ARGS_IDX_MEASURE_ITERATOR_TIMING: g_measure_iterator_timing_only = 1; break;
+            case ARGS_IDX_COMPUTE_PLMEDIAN: args->m_plmedian_info.m_output_fptr = fopen(optarg, "w"); break;
             case 'h': 
             case '?': usage();
             default: error("Unknown argument: %s\n", optarg);
@@ -3721,6 +3752,16 @@ int main_vcfmerge(int argc, char *argv[])
 #endif
     if(args->m_tag)
         free(args->m_tag);
+    if(args->m_plmedian_info.m_output_fptr)
+    {
+        if(args->m_plmedian_info.m_buffer_len)
+            free(args->m_plmedian_info.m_buffer);
+        if(args->m_plmedian_info.m_median_result_len)
+            free(args->m_plmedian_info.m_median_result);
+        if(args->m_plmedian_info.m_reorg_buffer_len)
+            free(args->m_plmedian_info.m_reorg_buffer);
+        fclose(args->m_plmedian_info.m_output_fptr);
+    }
     free(args);
 #ifdef DEBUG
     fclose(g_debug_fptr);

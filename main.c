@@ -37,6 +37,7 @@ int main_vcfstats(int argc, char *argv[]);
 int main_vcfisec(int argc, char *argv[]);
 int main_vcfmerge(int argc, char *argv[]);
 int main_vcfdiff(int argc, char *argv[]);
+int main_PLmedian(int argc, char *argv[]);
 int main_vcfquery(int argc, char *argv[]);
 int main_vcffilter(int argc, char *argv[]);
 int main_vcfsom(int argc, char *argv[]);
@@ -106,6 +107,10 @@ static cmd_t cmds[] =
     { .func  = main_vcfdiff, 
       .alias = "diff",
       .help  = "diff 2 VCF/BCF files"
+    },
+    { .func  = main_PLmedian, 
+      .alias = "PLmedian",
+      .help  = "Compute median of PL vector"
     },
     { .func  = main_vcfnorm, 
       .alias = "norm",
