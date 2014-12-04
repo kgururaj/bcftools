@@ -600,6 +600,13 @@ static void info_rules_init(args_t *args)
         info_rule_t *rule = &args->rules[n];
         rule->hdr_tag = strdup(ss);
         int id = bcf_hdr_id2int(args->out_hdr, BCF_DT_ID, rule->hdr_tag);
+	if(id < 0)
+	{
+	  fprintf(stderr,"WARNING: output header does not contain tag %s - dropping associated merge rule\n",rule->hdr_tag);
+	  ++n;
+	  continue;
+	}
+	ASSERT(id >=0 && id < args->out_hdr->n[BCF_DT_ID]);
         ASSERT(strcmp(args->out_hdr->id[BCF_DT_ID][id].key, rule->hdr_tag) == 0);
         if ( !bcf_hdr_idinfo_exists(args->out_hdr,BCF_HL_INFO,id) ) error("The tag is not defined in the header: \"%s\"\n", rule->hdr_tag);
         rule->type = bcf_hdr_id2type(args->out_hdr,BCF_HL_INFO,id);
@@ -3165,7 +3172,7 @@ void preprocess_header(args_t* args, int file_idx)
             {
                 //if there is a FORMAT field with the exact same name, don't bother to move/copy
                 //instead just DROP if move is requested
-                if(bcf_hdr_field_name2id(hdr,key_string, BCF_DT_ID, BCF_HL_FMT) >= 0)
+                if(bcf_hdr_field_type_id2int(hdr,key_string, BCF_DT_ID, BCF_HL_FMT) >= 0)
                 {
                     if(action_type == MERGE_MOVE_TO_FORMAT)
                         g_merge_config.file2id2action[file_idx][i] = MERGE_DROP;
@@ -3226,7 +3233,7 @@ void preprocess_header(args_t* args, int file_idx)
     for(j=0;j<add_idx;++j)
     {
         bcf_hdr_add_hrec(hdr, add_array[j].m_new_hrec);
-        int new_id = bcf_hdr_field_name2id(hdr, add_array[j].m_new_key, BCF_DT_ID, add_array[j].m_new_hrec->type);
+        int new_id = bcf_hdr_field_type_id2int(hdr, add_array[j].m_new_key, BCF_DT_ID, add_array[j].m_new_hrec->type);
         ASSERT(new_id >= 0);
         //Store mapping from original id to new id
         //The field is copied - so store in copy id array
