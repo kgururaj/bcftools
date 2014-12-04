@@ -1268,10 +1268,9 @@ int copy_string_field(char *src, int isrc, int src_len, kstring_t *dst, int idst
     return 0;
 }
 
-static void merge_AGR_info_tag(bcf_hdr_t *hdr, bcf1_t *line, bcf_info_t *info, int len, maux1_t *als, AGR_info_t *agr)
+static void merge_AGR_info_tag(bcf_hdr_t *hdr, bcf1_t *line, bcf_info_t *info, int len, maux1_t *als, AGR_info_t *agr, int num_merged_alleles)
 {
     int i;
-    maux1_t* als = &(ma->d[reader_idx][0]);
     if ( !agr->nbuf )
     {
         if ( info->type==BCF_BT_INT8 || info->type==BCF_BT_INT16 || info->type==BCF_BT_INT32 || info->type==BCF_BT_FLOAT )
@@ -1311,7 +1310,7 @@ static void merge_AGR_info_tag(bcf_hdr_t *hdr, bcf1_t *line, bcf_info_t *info, i
                 int iori, inew; \
                 if(line->m_non_ref_idx >= 0) \
                 { \
-                    initialize_ARG_vectors_for_NON_REF(line, len, als, (ma->nout_als), src, (agr->nvals), tgt, out_type_t); \
+                    initialize_ARG_vectors_for_NON_REF(line, len, als, num_merged_alleles, src, (agr->nvals), tgt, out_type_t); \
                 } \
                 for (iori=ifrom; iori<line->n_allele; iori++) \
                 { \
@@ -1339,7 +1338,7 @@ static void merge_AGR_info_tag(bcf_hdr_t *hdr, bcf1_t *line, bcf_info_t *info, i
                 int iori,jori, inew,jnew; \
                 if(line->m_non_ref_idx >= 0)  /*NON_REF allele*/ \
                 { \
-                    initialize_ARG_vectors_for_NON_REF(line, len, als, (ma->nout_als), src, (agr->nvals), tgt, out_type_t); \
+                    initialize_ARG_vectors_for_NON_REF(line, len, als, num_merged_alleles, src, (agr->nvals), tgt, out_type_t); \
                 } \
                 for (iori=0; iori<line->n_allele; iori++) \
                 { \
@@ -1521,7 +1520,7 @@ void merge_info(args_t *args, bcf1_t *out)
                 int idx = kh_val(tmph, kitr);
                 if ( idx<0 ) error("Error occurred while processing INFO tag \"%s\" at %s:%d\n", key,bcf_seqname(hdr,line),line->pos+1);
 #endif  //USE_ID_MAP
-                merge_AGR_info_tag(hdr, line,inf,len,&ma->d[i][0],&ma->AGR_info[idx]);
+                merge_AGR_info_tag(hdr, line,inf,len,&ma->d[i][0],&ma->AGR_info[idx], ma->nout_als);
                 continue;
             }
 #ifdef USE_ID_MAP
@@ -1809,6 +1808,7 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                         for (l=1; l<nsize; l++) { tgt++; tgt_set_vector_end; } \
                         continue; \
                     } \
+                    src = (src_type_t*) fmt_ori->p + j*fmt_ori->n; \
                     int ngsize = ma->smpl_ploidy[ismpl+j]==1 ? out->n_allele : out->n_allele*(out->n_allele + 1)/2; \
                     /*printf("Out num alleles %d num GT %d input num allele %d non_ref idx %d\n",out->n_allele, ngsize, line->n_allele, line->m_non_ref_idx);*/ \
                     if(line->m_non_ref_idx >= 0)  /*NON_REF allele*/ \
