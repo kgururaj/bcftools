@@ -71,6 +71,7 @@ typedef struct _args_t
     char *include_types, *exclude_types;
     int include, exclude;
     htsFile *out;
+    FILE* csv_out_fptr;
 }
 args_t;
 
@@ -208,12 +209,20 @@ static void init_data(args_t *args)
     // setup output
     char modew[8];
     strcpy(modew, "w");
-    if (args->clevel >= 0 && args->clevel <= 9) sprintf(modew + 1, "%d", args->clevel);
-    if (args->output_type==FT_BCF) strcat(modew, "bu");         // uncompressed BCF
-    else if (args->output_type & FT_BCF) strcat(modew, "b");    // compressed BCF
-    else if (args->output_type & FT_GZ) strcat(modew,"z");      // compressed VCF
-    args->out = hts_open(args->fn_out ? args->fn_out : "-", modew);
-    if ( !args->out ) error("%s: %s\n", args->fn_out,strerror(errno));
+    if(args->output_type != FT_TILEDB_CSV)
+    {
+      if (args->clevel >= 0 && args->clevel <= 9) sprintf(modew + 1, "%d", args->clevel);
+      if (args->output_type==FT_BCF) strcat(modew, "bu");         // uncompressed BCF
+      else if (args->output_type & FT_BCF) strcat(modew, "b");    // compressed BCF
+      else if (args->output_type & FT_GZ) strcat(modew,"z");      // compressed VCF
+      args->out = hts_open(args->fn_out ? args->fn_out : "-", modew);
+      if ( !args->out ) error("%s: %s\n", args->fn_out,strerror(errno));
+    }
+    else
+    {
+      args->csv_out_fptr = args->fn_out ? fopen(args->fn_out, modew) : stdout;
+      if(!(args->csv_out_fptr))  error("%s: %s\n", args->fn_out,strerror(errno));
+    }
 
     // headers: hdr=full header, hsub=subset header, hnull=sites only header
     if (args->sites_only)
@@ -490,6 +499,78 @@ static void usage(args_t *args)
     exit(1);
 }
 
+void write_csv_line(FILE* csv_fptr, bcf_hdr_t* out_hdr, bcf1_t* line, char** buffer, int* buffer_size)
+{
+    //FIXME: globally unique sample ids
+    //FIXME: globally unique filter ids
+    int i = 0;
+    bcf_unpack(line, BCF_UN_ALL);
+    for(i=0;i<bcf_hdr_nsamples(out_hdr);++i)
+    {
+        int num_values = -1;
+#define PRINT_TILEDB_CSV(field_name, bcf_ht_type, get_function, type_t, format_specifier, vector_end_condition, missing_condition)       \
+        { \
+            int num_elements = (*buffer_size)/sizeof(type_t); \
+            num_values = get_function(out_hdr, line, field_name, (void**)buffer, &num_elements, bcf_ht_type); \
+            if(num_elements*sizeof(type_t) > (*buffer_size)) \
+                (*buffer_size) = num_elements*sizeof(type_t); \
+            if(num_values < 0) \
+                fprintf(csv_fptr,",");  \
+            else \
+            { \
+                int k = 0;  \
+                type_t* ptr = (type_t*)(*buffer);      \
+                for(k=0;k<num_values;++k)   \
+                {   \
+                    type_t val = ptr[k];    \
+                    fprintf(csv_fptr,","); \
+                    if(missing_condition) \
+                        continue; \
+                    fprintf(csv_fptr,format_specifier,val);  \
+                }   \
+            } \
+        }
+        fprintf(csv_fptr,"%d,%d", i, line->pos+1);
+        {
+            int num_elements = (*buffer_size)/sizeof(int);
+            int num_values = bcf_get_info_values(out_hdr, line, "END", (void**)buffer, &num_elements, BCF_HT_INT);
+            if(num_values < 0)
+                fprintf(csv_fptr,",%d",line->pos+1);    //same as position
+            else
+                fprintf(csv_fptr,",%d",((int*)(*buffer))[0]);
+        }
+        fprintf(csv_fptr,",%s,%d", line->d.allele[0], line->n_allele-1);
+        int j = 0;
+        for(j=1;j<line->n_allele;++j)
+            fprintf(csv_fptr,",%s",line->d.allele[j]);
+        if(bcf_float_is_missing(line->qual))
+            fprintf(csv_fptr,",");
+        else
+            fprintf(csv_fptr,",%0.3f",line->qual);
+        fprintf(csv_fptr,",%d",line->d.n_flt);
+        for(j=0;j<line->d.n_flt;++j)
+            fprintf(csv_fptr,",%d",line->d.flt[j]);
+
+        PRINT_TILEDB_CSV("BaseQRankSum",BCF_HT_REAL, bcf_get_info_values, float,"%.2f",0,(bcf_float_is_missing(val)));
+        PRINT_TILEDB_CSV("ClippingRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)));
+        PRINT_TILEDB_CSV("MQRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)));
+        PRINT_TILEDB_CSV("ReadPosRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)));
+        PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing));
+        PRINT_TILEDB_CSV("MQ",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)));
+        PRINT_TILEDB_CSV("MQ0",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing));
+        PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
+        PRINT_TILEDB_CSV("MIN_DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
+        PRINT_TILEDB_CSV("GQ",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
+        PRINT_TILEDB_CSV("SB",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
+        if(num_values < 0)
+            fprintf(csv_fptr,",,,");
+        PRINT_TILEDB_CSV("AD",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
+        PRINT_TILEDB_CSV("PL",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
+    }
+    fprintf(csv_fptr,"\n");
+}
+
+#define FT_
 int main_vcfview(int argc, char *argv[])
 {
     int c;
@@ -552,6 +633,10 @@ int main_vcfview(int argc, char *argv[])
                     case 'u': args->output_type = FT_BCF; break;
                     case 'z': args->output_type = FT_VCF_GZ; break;
                     case 'v': args->output_type = FT_VCF; break;
+                    case 't':
+                              args->output_type = FT_TILEDB_CSV;
+                              args->print_header = 0;
+                              break;
                     default: error("The output type \"%s\" not recognised\n", optarg);
                 };
                 break;
@@ -688,15 +773,29 @@ int main_vcfview(int argc, char *argv[])
         error("BCF output requires header, cannot proceed with -H\n");
     if (!args->header_only)
     {
+        int buffer_size = 4096;
+        char* buffer = (char*)malloc(buffer_size*sizeof(char));
         while ( bcf_sr_next_line(args->files) )
         {
             bcf1_t *line = args->files->readers[0].buffer[0];
             if ( line->errcode && out_hdr!=args->hdr ) error("Undefined tags in the header, cannot proceed in the sample subset mode.\n");
             if ( subset_vcf(args, line) )
-                bcf_write1(args->out, out_hdr, line);
+            {
+                if(args->output_type & FT_TILEDB_CSV)
+                    write_csv_line(args->csv_out_fptr, out_hdr, line, &buffer, &buffer_size);
+                else
+                    bcf_write1(args->out, out_hdr, line);
+            }
         }
+        free(buffer);
     }
-    hts_close(args->out);
+    if(args->output_type & FT_TILEDB_CSV)
+    {
+        fflush(args->csv_out_fptr);
+        fclose(args->csv_out_fptr);
+    }
+    else
+        hts_close(args->out);
     destroy_data(args);
     bcf_sr_destroy(args->files);
     free(args);

@@ -34,6 +34,7 @@ THE SOFTWARE.  */
 #define FT_BCF (1<<2)
 #define FT_BCF_GZ (FT_GZ|FT_BCF)
 #define FT_STDIN (1<<3)
+#define FT_TILEDB_CSV (1<<4)
 
 char *bcftools_version(void);
 void error(const char *format, ...);
