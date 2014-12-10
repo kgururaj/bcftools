@@ -37,6 +37,13 @@ THE SOFTWARE.  */
 #include "bcftools.h"
 #include "filter.h"
 #include "htslib/khash_str2int.h"
+#include <sqlite3.h>
+
+#ifdef DEBUG
+#define ASSERT(x)  assert(x)
+#else
+#define ASSERT(x) ;
+#endif
 
 #define FLT_INCLUDE 1
 #define FLT_EXCLUDE 2
@@ -72,6 +79,10 @@ typedef struct _args_t
     int include, exclude;
     htsFile *out;
     FILE* csv_out_fptr;
+    int* input_sample_idx_2_global_idx;
+    int* input_field_idx_2_global_idx;
+    char sqlite_file[1024];
+    sqlite3* db;
 }
 args_t;
 
@@ -211,17 +222,32 @@ static void init_data(args_t *args)
     strcpy(modew, "w");
     if(args->output_type != FT_TILEDB_CSV)
     {
-      if (args->clevel >= 0 && args->clevel <= 9) sprintf(modew + 1, "%d", args->clevel);
-      if (args->output_type==FT_BCF) strcat(modew, "bu");         // uncompressed BCF
-      else if (args->output_type & FT_BCF) strcat(modew, "b");    // compressed BCF
-      else if (args->output_type & FT_GZ) strcat(modew,"z");      // compressed VCF
-      args->out = hts_open(args->fn_out ? args->fn_out : "-", modew);
-      if ( !args->out ) error("%s: %s\n", args->fn_out,strerror(errno));
+        if (args->clevel >= 0 && args->clevel <= 9) sprintf(modew + 1, "%d", args->clevel);
+        if (args->output_type==FT_BCF) strcat(modew, "bu");         // uncompressed BCF
+        else if (args->output_type & FT_BCF) strcat(modew, "b");    // compressed BCF
+        else if (args->output_type & FT_GZ) strcat(modew,"z");      // compressed VCF
+        args->out = hts_open(args->fn_out ? args->fn_out : "-", modew);
+        if ( !args->out ) error("%s: %s\n", args->fn_out,strerror(errno));
     }
     else
     {
-      args->csv_out_fptr = args->fn_out ? fopen(args->fn_out, modew) : stdout;
-      if(!(args->csv_out_fptr))  error("%s: %s\n", args->fn_out,strerror(errno));
+        if(args->sqlite_file[0] == '\0')
+        {
+            fprintf(stderr, "To print out a TileDB csv file, you must pass the path to the samples and field names sqlite table using the --sqlite argument\n");
+            exit(-1);
+        }
+        if(sqlite3_open(args->sqlite_file, &(args->db)) != 0)
+        {
+            fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(args->db)); 
+            sqlite3_close(args->db);
+            exit(-1);
+        }
+        args->csv_out_fptr = args->fn_out ? fopen(args->fn_out, modew) : stdout;
+        if(!(args->csv_out_fptr)) 
+        {
+            error("%s: %s\n", args->fn_out,strerror(errno));
+            exit(-1);
+        }
     }
 
     // headers: hdr=full header, hsub=subset header, hnull=sites only header
@@ -257,6 +283,12 @@ static void destroy_data(args_t *args)
     if ( args->filter )
         filter_destroy(args->filter);
     free(args->ac);
+    if(args->input_field_idx_2_global_idx)
+      free(args->input_field_idx_2_global_idx);
+    if(args->input_sample_idx_2_global_idx)
+      free(args->input_sample_idx_2_global_idx);
+    if(args->db)
+      sqlite3_close(args->db);
 }
 
 // true if all samples are phased.
@@ -499,10 +531,69 @@ static void usage(args_t *args)
     exit(1);
 }
 
-void write_csv_line(FILE* csv_fptr, bcf_hdr_t* out_hdr, bcf1_t* line, char** buffer, int* buffer_size)
+typedef struct
 {
-    //FIXME: globally unique sample ids
-    //FIXME: globally unique filter ids
+  int* input_2_global_idx_array;
+  int input_idx;
+}control_struct;
+
+int sqlite_handler(void* ptr, int num_columns, char** field_values, char** column_names)
+{
+  assert(num_columns == 1);
+  int global_idx = strtol(field_values[0], 0, 10);
+  control_struct* data = (control_struct*)ptr;
+  data->input_2_global_idx_array[data->input_idx] = global_idx;
+  return 0;
+}
+
+void initialize_samples_and_fields_idx(args_t* args, bcf_hdr_t* hdr)
+{
+  char* error_msg = 0;
+  char query_string[4096];
+  char insert_string[4096];
+  control_struct data;
+
+  int i = 0;
+
+  args->input_sample_idx_2_global_idx = (int*)malloc(bcf_hdr_nsamples(hdr)*sizeof(int));
+  memset(args->input_sample_idx_2_global_idx, -1, bcf_hdr_nsamples(hdr)*sizeof(int));  //initialize to -1
+  args->input_field_idx_2_global_idx = (int*)malloc(hdr->n[BCF_DT_ID]*sizeof(int));
+  memset(args->input_field_idx_2_global_idx, -1,hdr->n[BCF_DT_ID]*sizeof(int));        //initialize to -1 
+
+  data.input_2_global_idx_array = args->input_sample_idx_2_global_idx;
+  for(i=0;i<bcf_hdr_nsamples(hdr);++i)
+  {
+    data.input_idx = i; 
+    sprintf(query_string,"select sample_idx from sample_names where sample_names.sample_name == \"%s\";",hdr->samples[i]);
+    sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
+    if(data.input_2_global_idx_array[i] == -1)
+    {
+      sprintf(insert_string,"insert into sample_names (sample_name) values( \"%s\" );",hdr->samples[i]);
+      sqlite3_exec(args->db, insert_string, 0, 0, &error_msg);
+      sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
+      assert(data.input_2_global_idx_array[i] >= 0);
+    }
+  }
+
+  data.input_2_global_idx_array = args->input_field_idx_2_global_idx;
+  for(i=0;i<hdr->n[BCF_DT_ID];++i)
+  {
+    data.input_idx = i; 
+    sprintf(query_string,"select field_idx from field_names where field_names.field_name == \"%s\";",bcf_hdr_int2id(hdr, BCF_DT_ID, i));
+    sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
+    if(data.input_2_global_idx_array[i] == -1)
+    {
+      sprintf(insert_string,"insert into field_names (field_name) values( \"%s\" );",bcf_hdr_int2id(hdr, BCF_DT_ID, i));
+      sqlite3_exec(args->db, insert_string, 0, 0, &error_msg);
+      sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
+      assert(data.input_2_global_idx_array[i] >= 0);
+    }
+  }
+}
+
+void write_csv_line(args_t* args, bcf_hdr_t* out_hdr, bcf1_t* line, char** buffer, int* buffer_size)
+{
+    FILE* csv_fptr = args->csv_out_fptr;
     int i = 0;
     bcf_unpack(line, BCF_UN_ALL);
     for(i=0;i<bcf_hdr_nsamples(out_hdr);++i)
@@ -530,7 +621,11 @@ void write_csv_line(FILE* csv_fptr, bcf_hdr_t* out_hdr, bcf1_t* line, char** buf
                 }   \
             } \
         }
-        fprintf(csv_fptr,"%d,%d", i, line->pos+1);
+        //Print co-ordinates : sample id, location
+        ASSERT(args->input_sample_idx_2_global_idx[i] >= 0);
+        ASSERT(args->input_sample_idx_2_global_idx[i] >= 0);
+        fprintf(csv_fptr,"%d,%d", args->input_sample_idx_2_global_idx[i], line->pos+1);
+        //print END position
         {
             int num_elements = (*buffer_size)/sizeof(int);
             int num_values = bcf_get_info_values(out_hdr, line, "END", (void**)buffer, &num_elements, BCF_HT_INT);
@@ -539,18 +634,26 @@ void write_csv_line(FILE* csv_fptr, bcf_hdr_t* out_hdr, bcf1_t* line, char** buf
             else
                 fprintf(csv_fptr,",%d",((int*)(*buffer))[0]);
         }
+        //print reference allele and number of ALT alleles
         fprintf(csv_fptr,",%s,%d", line->d.allele[0], line->n_allele-1);
+        //print alt alleles
         int j = 0;
         for(j=1;j<line->n_allele;++j)
             fprintf(csv_fptr,",%s",line->d.allele[j]);
+        //print QUAL
         if(bcf_float_is_missing(line->qual))
             fprintf(csv_fptr,",");
         else
             fprintf(csv_fptr,",%0.3f",line->qual);
+        //print number of filters, followed by filter idx
         fprintf(csv_fptr,",%d",line->d.n_flt);
         for(j=0;j<line->d.n_flt;++j)
-            fprintf(csv_fptr,",%d",line->d.flt[j]);
-
+        {
+            ASSERT(line->d.flt[j] >= 0 && line->d.flt[j] < out_hdr->n[BCF_DT_ID]);
+            ASSERT(args->input_field_idx_2_global_idx[line->d.flt[j]] >= 0);
+            fprintf(csv_fptr,",%d",args->input_field_idx_2_global_idx[line->d.flt[j]]);
+        }
+        //Print relevant INFO fields
         PRINT_TILEDB_CSV("BaseQRankSum",BCF_HT_REAL, bcf_get_info_values, float,"%.2f",0,(bcf_float_is_missing(val)));
         PRINT_TILEDB_CSV("ClippingRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)));
         PRINT_TILEDB_CSV("MQRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)));
@@ -558,6 +661,7 @@ void write_csv_line(FILE* csv_fptr, bcf_hdr_t* out_hdr, bcf1_t* line, char** buf
         PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing));
         PRINT_TILEDB_CSV("MQ",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)));
         PRINT_TILEDB_CSV("MQ0",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing));
+        //Print relevant FORMAT fields
         PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
         PRINT_TILEDB_CSV("MIN_DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
         PRINT_TILEDB_CSV("GQ",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
@@ -569,6 +673,12 @@ void write_csv_line(FILE* csv_fptr, bcf_hdr_t* out_hdr, bcf1_t* line, char** buf
     }
     fprintf(csv_fptr,"\n");
 }
+
+enum ArgsIdxEnum
+{
+  ARGS_IDX_SQLITE_FILE=10000,
+  ARGS_IDX_TAG
+};
 
 #define FT_
 int main_vcfview(int argc, char *argv[])
@@ -620,6 +730,7 @@ int main_vcfview(int argc, char *argv[])
         {"max-af",1,0,'Q'},
         {"phased",0,0,'p'},
         {"exclude-phased",0,0,'P'},
+        {"sqlite",1,0,ARGS_IDX_SQLITE_FILE},
         {0,0,0,0}
     };
     while ((c = getopt_long(argc, argv, "l:t:T:r:R:o:O:s:S:Gf:knv:V:m:M:auUhHc:C:Ii:e:xXpPq:Q:g:",loptions,NULL)) >= 0)
@@ -721,6 +832,9 @@ int main_vcfview(int argc, char *argv[])
                 else error("The argument to -g not recognised. Expected one of hom/het/^hom/^het, got \"%s\".\n", optarg);
                 break;
             }
+            case ARGS_IDX_SQLITE_FILE:
+                strcpy(args->sqlite_file, optarg);
+                break;
             case '?': usage(args);
             default: error("Unknown argument: %s\n", optarg);
         }
@@ -766,7 +880,9 @@ int main_vcfview(int argc, char *argv[])
     if ( !bcf_sr_add_reader(args->files, fname) ) error("Failed to open %s: %s\n", fname,bcf_sr_strerror(args->files->errnum));
 
     init_data(args);
+
     bcf_hdr_t *out_hdr = args->hnull ? args->hnull : (args->hsub ? args->hsub : args->hdr);
+    initialize_samples_and_fields_idx(args, out_hdr);
     if (args->print_header)
         bcf_hdr_write(args->out, out_hdr);
     else if ( args->output_type & FT_BCF )
@@ -782,7 +898,7 @@ int main_vcfview(int argc, char *argv[])
             if ( subset_vcf(args, line) )
             {
                 if(args->output_type & FT_TILEDB_CSV)
-                    write_csv_line(args->csv_out_fptr, out_hdr, line, &buffer, &buffer_size);
+                    write_csv_line(args, out_hdr, line, &buffer, &buffer_size);
                 else
                     bcf_write1(args->out, out_hdr, line);
             }

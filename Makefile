@@ -176,7 +176,7 @@ test/test-rbuf: test/test-rbuf.o
 	$(CC) $(CFLAGS) -o $@ -lm -ldl $<
 
 bcftools: $(HTSLIB) $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) -Wl,-Bstatic -L$(HTSDIR) -lhts -Wl,-Bdynamic -lpthread -lz -lm -ldl $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) -Wl,-Bstatic -L$(HTSDIR) -lhts -Wl,-Bdynamic -lpthread -lz -lm -ldl -lsqlite3 $(LDLIBS)
 
 doc/bcftools.1: doc/bcftools.txt
 	cd doc && a2x -adate="$(DOC_DATE)" -aversion=$(DOC_VERSION) --doctype manpage --format manpage bcftools.txt
