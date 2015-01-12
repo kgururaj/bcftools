@@ -38,6 +38,7 @@ THE SOFTWARE.  */
 #include "filter.h"
 #include "htslib/khash_str2int.h"
 #include <sqlite3.h>
+#include <inttypes.h>
 
 #ifdef DEBUG
 #define ASSERT(x)  assert(x)
@@ -81,6 +82,8 @@ typedef struct _args_t
     FILE* csv_out_fptr;
     int* input_sample_idx_2_global_idx;
     int* input_field_idx_2_global_idx;
+    int* input_contig_idx_2_global_idx;
+    uint64_t* input_contig_idx_2_offset;
     char sqlite_file[1024];
     sqlite3* db;
 }
@@ -284,11 +287,15 @@ static void destroy_data(args_t *args)
         filter_destroy(args->filter);
     free(args->ac);
     if(args->input_field_idx_2_global_idx)
-      free(args->input_field_idx_2_global_idx);
+        free(args->input_field_idx_2_global_idx);
     if(args->input_sample_idx_2_global_idx)
-      free(args->input_sample_idx_2_global_idx);
+        free(args->input_sample_idx_2_global_idx);
+    if(args->input_contig_idx_2_global_idx)
+        free(args->input_contig_idx_2_global_idx);
+    if(args->input_contig_idx_2_offset)
+        free(args->input_contig_idx_2_offset);
     if(args->db)
-      sqlite3_close(args->db);
+        sqlite3_close(args->db);
 }
 
 // true if all samples are phased.
@@ -535,67 +542,146 @@ typedef struct
 {
   int* input_2_global_idx_array;
   int input_idx;
-}control_struct;
+  uint64_t contig_length;
+  uint64_t* contig_offsets;
+}sqlite_data_struct;
 
 int sqlite_handler(void* ptr, int num_columns, char** field_values, char** column_names)
 {
   assert(num_columns == 1);
   int global_idx = strtol(field_values[0], 0, 10);
-  control_struct* data = (control_struct*)ptr;
+  sqlite_data_struct* data = (sqlite_data_struct*)ptr;
   data->input_2_global_idx_array[data->input_idx] = global_idx;
   return 0;
 }
 
-void initialize_samples_and_fields_idx(args_t* args, bcf_hdr_t* hdr)
+int contig_sqlite_handler(void* ptr, int num_columns, char** field_values, char** column_names)
 {
-  char* error_msg = 0;
-  char query_string[4096];
-  char insert_string[4096];
-  control_struct data;
-
-  int i = 0;
-
-  args->input_sample_idx_2_global_idx = (int*)malloc(bcf_hdr_nsamples(hdr)*sizeof(int));
-  memset(args->input_sample_idx_2_global_idx, -1, bcf_hdr_nsamples(hdr)*sizeof(int));  //initialize to -1
-  args->input_field_idx_2_global_idx = (int*)malloc(hdr->n[BCF_DT_ID]*sizeof(int));
-  memset(args->input_field_idx_2_global_idx, -1,hdr->n[BCF_DT_ID]*sizeof(int));        //initialize to -1 
-
-  data.input_2_global_idx_array = args->input_sample_idx_2_global_idx;
-  for(i=0;i<bcf_hdr_nsamples(hdr);++i)
-  {
-    data.input_idx = i; 
-    sprintf(query_string,"select sample_idx from sample_names where sample_names.sample_name == \"%s\";",hdr->samples[i]);
-    sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
-    if(data.input_2_global_idx_array[i] == -1)
-    {
-      sprintf(insert_string,"insert into sample_names (sample_name) values( \"%s\" );",hdr->samples[i]);
-      sqlite3_exec(args->db, insert_string, 0, 0, &error_msg);
-      sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
-      assert(data.input_2_global_idx_array[i] >= 0);
-    }
-  }
-
-  data.input_2_global_idx_array = args->input_field_idx_2_global_idx;
-  for(i=0;i<hdr->n[BCF_DT_ID];++i)
-  {
-    data.input_idx = i; 
-    sprintf(query_string,"select field_idx from field_names where field_names.field_name == \"%s\";",bcf_hdr_int2id(hdr, BCF_DT_ID, i));
-    sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
-    if(data.input_2_global_idx_array[i] == -1)
-    {
-      sprintf(insert_string,"insert into field_names (field_name) values( \"%s\" );",bcf_hdr_int2id(hdr, BCF_DT_ID, i));
-      sqlite3_exec(args->db, insert_string, 0, 0, &error_msg);
-      sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
-      assert(data.input_2_global_idx_array[i] >= 0);
-    }
-  }
+    assert(num_columns == 3);
+    if(sqlite_handler(ptr, 1, field_values, column_names) != 0)
+        return -1;
+    sqlite_data_struct* data = (sqlite_data_struct*)ptr;
+    data->contig_length = strtoull(field_values[1], 0, 10);
+    data->contig_offsets[data->input_idx] = strtoull(field_values[2], 0, 10);
+    return 0;
 }
 
+typedef struct
+{
+    uint64_t contig_offset;
+    uint64_t contig_length;
+}max_contig_data_struct;
+
+int max_contig_offset_sqlite_handler(void* ptr, int num_columns, char** field_values, char** column_names)
+{
+    assert(num_columns == 2);
+    max_contig_data_struct* data = (max_contig_data_struct*)ptr;
+    data->contig_length = strtoll(field_values[0], 0, 10);
+    data->contig_offset = strtoll(field_values[1], 0, 10);
+    return 0;
+}
+
+void initialize_samples_contigs_and_fields_idx(args_t* args, bcf_hdr_t* hdr)
+{
+    char* error_msg = 0;
+    char query_string[4096];
+    char insert_string[4096];
+    sqlite_data_struct data;
+    
+    //max contig offset
+    const char* max_contig_offset_query = "select contig_length, contig_offset from contig_names order by contig_offset desc limit 1;";
+    max_contig_data_struct max_contig;
+    //First time
+    max_contig.contig_offset = 0ull;
+    max_contig.contig_length = 0ull;
+
+    int i = 0;
+
+    args->input_sample_idx_2_global_idx = (int*)malloc(bcf_hdr_nsamples(hdr)*sizeof(int));
+    memset(args->input_sample_idx_2_global_idx, -1, bcf_hdr_nsamples(hdr)*sizeof(int));  //initialize to -1
+    args->input_field_idx_2_global_idx = (int*)malloc(hdr->n[BCF_DT_ID]*sizeof(int));
+    memset(args->input_field_idx_2_global_idx, -1,hdr->n[BCF_DT_ID]*sizeof(int));        //initialize to -1 
+    args->input_contig_idx_2_global_idx = (int*)malloc(hdr->n[BCF_DT_CTG]*sizeof(int));
+    memset(args->input_contig_idx_2_global_idx, -1, hdr->n[BCF_DT_CTG]*sizeof(int));     //initialize to -1
+    args->input_contig_idx_2_offset = (uint64_t*)malloc(hdr->n[BCF_DT_CTG]*sizeof(uint64_t));
+
+    //Samples 
+    data.input_2_global_idx_array = args->input_sample_idx_2_global_idx;
+    for(i=0;i<bcf_hdr_nsamples(hdr);++i)
+    {
+        data.input_idx = i; 
+        sprintf(query_string,"select sample_idx from sample_names where sample_names.sample_name == \"%s\";",hdr->samples[i]);
+        sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
+        if(data.input_2_global_idx_array[i] == -1)
+        {
+            sprintf(insert_string,"insert into sample_names (sample_name) values( \"%s\" );",hdr->samples[i]);
+            sqlite3_exec(args->db, insert_string, 0, 0, &error_msg);
+            sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
+            assert(data.input_2_global_idx_array[i] >= 0);
+        }
+    }
+
+    //Contigs
+    data.input_2_global_idx_array = args->input_contig_idx_2_global_idx;
+    data.contig_offsets = args->input_contig_idx_2_offset;
+    for(i=0;i<hdr->n[BCF_DT_CTG];++i)
+    {
+        uint64_t curr_contig_length = bcf_hdr_id2contig_length(hdr, i);
+        assert(curr_contig_length > 0);
+        //query
+        data.input_idx = i; 
+        sprintf(query_string,"select contig_idx,contig_length,contig_offset from contig_names where contig_names.contig_name == \"%s\";",
+                bcf_hdr_int2id(hdr, BCF_DT_CTG, i));
+        sqlite3_exec(args->db, query_string, contig_sqlite_handler, &data, &error_msg);
+        //why the retry?
+        //the schema forces contig_offset to have unique values, if multiple inserts are tried in parallel, only one will succeed 
+        while(data.input_2_global_idx_array[i] == -1)
+        {
+            //get max offset value from SQL
+            sqlite3_exec(args->db, max_contig_offset_query, max_contig_offset_sqlite_handler, &max_contig, &error_msg);
+            //Compute offset for new entry and insert
+            sprintf(insert_string,"insert into contig_names (contig_name, contig_length, contig_offset) values( \"%s\",%" PRIu64 ",%" PRIu64 " );",
+                    bcf_hdr_int2id(hdr, BCF_DT_CTG, i), curr_contig_length, max_contig.contig_offset + max_contig.contig_length);
+            error_msg = 0;
+            //May fail because of parallel insert
+            if(sqlite3_exec(args->db, insert_string, 0, 0, &error_msg) == SQLITE_OK)
+            {
+                sqlite3_exec(args->db, query_string, contig_sqlite_handler, &data, &error_msg);
+                assert(data.input_2_global_idx_array[i] >= 0);
+            }
+            else
+                if(error_msg)
+                    free(error_msg);
+        }
+        assert(data.contig_length == curr_contig_length);       //should be same as current contig
+    }
+
+    //INFO/FILTER/FORMAT fields
+    data.input_2_global_idx_array = args->input_field_idx_2_global_idx;
+    for(i=0;i<hdr->n[BCF_DT_ID];++i)
+    {
+        data.input_idx = i; 
+        sprintf(query_string,"select field_idx from field_names where field_names.field_name == \"%s\";",bcf_hdr_int2id(hdr, BCF_DT_ID, i));
+        sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
+        if(data.input_2_global_idx_array[i] == -1)
+        {
+            sprintf(insert_string,"insert into field_names (field_name) values( \"%s\" );",bcf_hdr_int2id(hdr, BCF_DT_ID, i));
+            sqlite3_exec(args->db, insert_string, 0, 0, &error_msg);
+            sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
+            assert(data.input_2_global_idx_array[i] >= 0);
+        }
+    }
+}
+
+#define CSV_MISSING_CHARACTER '#'
 void write_csv_line(args_t* args, bcf_hdr_t* out_hdr, bcf1_t* line, char** buffer, int* buffer_size)
 {
     FILE* csv_fptr = args->csv_out_fptr;
     int i = 0;
     bcf_unpack(line, BCF_UN_ALL);
+    int contig_id = line->rid;
+    ASSERT(args->input_contig_idx_2_global_idx[contig_id] >= 0);
+    uint64_t contig_offset = args->input_contig_idx_2_offset[contig_id];
     for(i=0;i<bcf_hdr_nsamples(out_hdr);++i)
     {
         int num_values = -1;
@@ -606,7 +692,7 @@ void write_csv_line(args_t* args, bcf_hdr_t* out_hdr, bcf1_t* line, char** buffe
             if(num_elements*sizeof(type_t) > (*buffer_size)) \
                 (*buffer_size) = num_elements*sizeof(type_t); \
             if(num_values < 0) \
-                fprintf(csv_fptr,",");  \
+                fprintf(csv_fptr,",%c",CSV_MISSING_CHARACTER);  \
             else \
             { \
                 int k = 0;  \
@@ -624,25 +710,34 @@ void write_csv_line(args_t* args, bcf_hdr_t* out_hdr, bcf1_t* line, char** buffe
         //Print co-ordinates : sample id, location
         ASSERT(args->input_sample_idx_2_global_idx[i] >= 0);
         ASSERT(args->input_sample_idx_2_global_idx[i] >= 0);
-        fprintf(csv_fptr,"%d,%d", args->input_sample_idx_2_global_idx[i], line->pos+1);
+        uint64_t position = contig_offset + ((uint64_t)line->pos) + 1;
+        fprintf(csv_fptr,"%d,%"PRIu64, args->input_sample_idx_2_global_idx[i], position);
         //print END position
         {
             int num_elements = (*buffer_size)/sizeof(int);
             int num_values = bcf_get_info_values(out_hdr, line, "END", (void**)buffer, &num_elements, BCF_HT_INT);
             if(num_values < 0)
-                fprintf(csv_fptr,",%d",line->pos+1);    //same as position
+                fprintf(csv_fptr,",%"PRIu64,position);    //same as position
             else
-                fprintf(csv_fptr,",%d",((int*)(*buffer))[0]);
+            {
+                int end_pos = ((int*)(*buffer))[0];
+                fprintf(csv_fptr,",%"PRIu64, contig_offset + ((uint64_t)end_pos));
+            }
         }
         //print reference allele and number of ALT alleles
         fprintf(csv_fptr,",%s,%d", line->d.allele[0], line->n_allele-1);
         //print alt alleles
         int j = 0;
         for(j=1;j<line->n_allele;++j)
-            fprintf(csv_fptr,",%s",line->d.allele[j]);
+        {
+            if(strcmp(line->d.allele[j],"<NON_REF>") == 0)
+                fprintf(csv_fptr,",&");
+            else
+                fprintf(csv_fptr,",%s",line->d.allele[j]);
+        }
         //print QUAL
         if(bcf_float_is_missing(line->qual))
-            fprintf(csv_fptr,",");
+            fprintf(csv_fptr,",%c",CSV_MISSING_CHARACTER);
         else
             fprintf(csv_fptr,",%0.3f",line->qual);
         //print number of filters, followed by filter idx
@@ -667,8 +762,11 @@ void write_csv_line(args_t* args, bcf_hdr_t* out_hdr, bcf1_t* line, char** buffe
         PRINT_TILEDB_CSV("GQ",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
         PRINT_TILEDB_CSV("SB",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
         if(num_values < 0)
-            fprintf(csv_fptr,",,,");
+            fprintf(csv_fptr,",%c,%c,%c",CSV_MISSING_CHARACTER, CSV_MISSING_CHARACTER, CSV_MISSING_CHARACTER);
         PRINT_TILEDB_CSV("AD",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
+        if(num_values < 0)
+          for(j=0;j<line->n_allele-1;++j)       //missing values for N-1 alleles, as PRINT_TILEDB_CSV would have added one missing char
+            fprintf(csv_fptr,",%c",CSV_MISSING_CHARACTER);
         PRINT_TILEDB_CSV("PL",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
     }
     fprintf(csv_fptr,"\n");
@@ -882,7 +980,7 @@ int main_vcfview(int argc, char *argv[])
     init_data(args);
 
     bcf_hdr_t *out_hdr = args->hnull ? args->hnull : (args->hsub ? args->hsub : args->hdr);
-    initialize_samples_and_fields_idx(args, out_hdr);
+    initialize_samples_contigs_and_fields_idx(args, out_hdr);
     if (args->print_header)
         bcf_hdr_write(args->out, out_hdr);
     else if ( args->output_type & FT_BCF )
