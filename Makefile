@@ -56,12 +56,13 @@ ifdef PROFILE
 endif
 CFLAGS+=	-Wall -Wc++-compat
 DFLAGS=
-OBJS     = main.o vcfindex.o tabix.o \
+LIB_OBJS     = vcfindex.o tabix.o \
            vcfstats.o vcfisec.o vcfmerge.o vcfdiff.o vcfPLmedian.o vcfquery.o vcffilter.o filter.o vcfsom.o \
            vcfnorm.o vcfgtcheck.o vcfview.o vcfannotate.o vcfroh.o vcfconcat.o \
            vcfcall.o mcall.o vcmp.o gvcf.o reheader.o convert.o vcfconvert.o tsv2vcf.o \
            vcfcnv.o HMM.o vcfplugin.o consensus.o ploidy.o version.o \
            ccall.o em.o prob1.o kmin.o # the original samtools calling
+OBJS = main.o $(LIB_OBJS)
 INCLUDES=	-I. -I$(HTSDIR)
 
 # The polysomy command is not compiled by default because it brings dependency
@@ -86,7 +87,7 @@ INSTALL_DATA    = $(INSTALL) -m 644
 INSTALL_DIR     = $(MKDIR_P) -m 755
 
 
-all:$(PROG) plugins
+all:$(PROG) libbcftools.a plugins
 
 # See htslib/Makefile
 PACKAGE_VERSION = 1.1
@@ -174,6 +175,9 @@ test/test-rbuf.o: test/test-rbuf.c rbuf.h
 
 test/test-rbuf: test/test-rbuf.o
 	$(CC) $(CFLAGS) -o $@ -lm -ldl $<
+
+libbcftools.a: $(HTSLIB) $(LIB_OBJS)
+	ar rcs libbcftools.a $(LIB_OBJS)
 
 bcftools: $(HTSLIB) $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) -Wl,-Bstatic -L$(HTSDIR) -lhts -Wl,-Bdynamic -lpthread -lz -lm -ldl -lsqlite3 $(LDLIBS)

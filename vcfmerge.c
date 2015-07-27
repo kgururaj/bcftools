@@ -130,22 +130,34 @@ typedef struct
 
 typedef struct
 {
-    int* m_id_2_merged_id;
+    //Num fields in original header
+    int m_num_original_ids;
+    //Num fields in the preprocessed header
     int m_num_ids;
+    //GQ id
+    int m_GQ_id;
+    //Mapping from preprocessed field id to merged field id
+    int* m_id_2_merged_id;
     //Map from original to preprocessed
     int* m_original_id_2_preprocessed_id;
     //Map from original to preprocessed if the field needs to be copied somewhere else
     int* m_original_id_2_preprocessed_copy_id;
-    int m_num_original_ids;
-    //GQ id
-    int m_GQ_id;
+    //Map from sample idx in VCF to merged sample idx
+    int* m_sample_idx_2_merged_idx;
+    //Map from sqlite DB for tileDB
+    sqlite_mappings_struct m_sqlite_mapping_info;
+    //TileDB output params
+    csv_output_struct m_csv_output_info;
 }reader_idmap;
 
 typedef struct
 {
-    reader_idmap* m_readers_map;
-    int** m_merged_id_2_reader_idmap; //2D map [nreaders][num_output_ids]
+    //Num merged fields
     int m_num_merged_ids;
+    //Mapping info from input file to merged file
+    reader_idmap* m_readers_map;
+    //Mapping for fields from merged header to input header
+    int** m_merged_id_2_reader_idmap; //2D map [nreaders][num_output_ids]
     //map from id in merged hdr to index in merged bcf1_t* out
     int* m_merged_id_2_merged_idx; 
     //map from id in merged hdr to index in info_rules, -1 if none
@@ -167,23 +179,6 @@ typedef struct
     //flag whether merged line has only 1 variant of type NON_REF
     int m_merged_has_only_non_ref;
 }idmap;
-
-//calloc on args_t sets everything to 0
-typedef struct
-{
-    FILE* m_output_fptr;
-    int* m_median_result;
-    int m_median_result_len;
-    int* m_buffer;
-    int m_buffer_len;
-    int* m_reorg_buffer;
-    int m_reorg_buffer_len;
-}plmedian_struct;
-
-int compute_PLmedian(bcf_hdr_t* hdr, bcf1_t* line, int** median_result, int* median_result_len,
-        int** buffer, int* buffer_len,
-        int** reorg_buffer, int* reorg_buffer_len);
-void print_PLmedian(FILE* fptr, bcf_hdr_t* hdr, bcf1_t* line, int* median_result, int median_result_len);
 
 typedef struct
 {
@@ -214,6 +209,7 @@ typedef struct
     char **argv;
     int argc;
     plmedian_struct  m_plmedian_info;
+    tiledb_struct m_tiledb_info;
 }
 args_t;
 
@@ -232,6 +228,7 @@ FILE* g_vcf_debug_fptr = 0;
 unsigned g_preprocess_vcfs = 0;
 unsigned g_is_input_gvcf = 0;
 unsigned g_do_gatk_merge = 0;
+unsigned g_do_tiledb_merge = 0;
 const char* g_info2format_suffix = "_INFO";
 unsigned g_measure_iterator_timing_only = 0;
 
@@ -258,6 +255,14 @@ typedef struct
 }merge_config;
 strdict_t*  g_merge_config_token_2_idx = 0;
 merge_config g_merge_config = { 0, 0, 0, 0, 0, 0 };
+
+int compare_global_samples_struct(const void* x, const void* y)
+{
+    const global_samples_struct* X = (const global_samples_struct*)x;
+    const global_samples_struct* Y = (const global_samples_struct*)y;
+    return ((X->m_global_sample_idx < Y->m_global_sample_idx) ? -1 : 1);	//never equal
+}
+
 
 int get_merge_action(const char* key_string, int is_info, int is_format)
 {
@@ -1418,6 +1423,7 @@ void merge_info(args_t *args, bcf1_t *out)
     ma->nAGR_info = 0;
     out->n_info   = 0;
     info_rules_reset(args);     //zero out everything
+    int curr_end_point = -1;
     for (i=0; i<files->nreaders; i++)
     {
         if ( !ma->has_line[i] ) continue;
@@ -1445,9 +1451,14 @@ void merge_info(args_t *args, bcf1_t *out)
             const char* out_key = bcf_hdr_int2id(out_hdr, BCF_DT_ID, id);
             ASSERT(out_key && strcmp(out_key, key) == 0);       //same as this key
 #endif //DEBUG
-            //is END info tag, but pos == end - don't add END tag
-            if(id == args->m_idmap.m_merged_END_info_id && bcf_get_end_point(line) == out->pos)
-                continue;
+            //is END info tag
+            if(id == args->m_idmap.m_merged_END_info_id)
+	    {
+	      curr_end_point = bcf_get_end_point(line);
+	      //is END info tag, but pos == end - don't add END tag
+	      if(curr_end_point == out->pos)
+		continue;
+	    }
 #else  //USE_ID_MAP
             int id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, key);
             if ( id==-1 ) error("Error: The INFO field is not defined in the header: %s\n", key);
@@ -1572,6 +1583,11 @@ void merge_info(args_t *args, bcf1_t *out)
     {
         AGR_info_t *agr = &ma->AGR_info[i];
         bcf_update_info(out_hdr,out,agr->hdr_tag,agr->buf,agr->nvals,agr->type);
+    }
+    if(curr_end_point != -1 && curr_end_point != out->pos)
+    {
+	++curr_end_point;	//as end point is internally computed 0-based, but VCF expects 1 based
+	bcf_update_info_int32(out_hdr, out, "END", &curr_end_point, 1);
     }
 }
 
@@ -2834,6 +2850,10 @@ void merge_buffer(args_t *args)
             }
     }
 
+    int curr_global_contig_idx = -1;
+#ifdef DEBUG
+    int64_t curr_global_position = -1;
+#endif
     // set the current position
     for (i=0; i<files->nreaders; i++)
     {
@@ -2843,25 +2863,140 @@ void merge_buffer(args_t *args)
             pos = line->pos;
             var_type = bcf_get_variant_types(line);
             id = line->d.id;
+            if(g_do_tiledb_merge)
+            {
+                curr_global_contig_idx =
+                    args->m_idmap.m_readers_map[i].m_sqlite_mapping_info.input_contig_idx_2_global_idx[line->rid];
+#ifdef DEBUG
+                ASSERT(curr_global_contig_idx >= 0);
+		curr_global_position = args->m_idmap.m_readers_map[i].m_sqlite_mapping_info.input_contig_idx_2_offset[line->rid]
+		  + ((int64_t)line->pos);
+#endif
+            }
             break;
         }
     }
-    if(g_measure_iterator_timing_only)
+    //This code block is useful only for producing sorted CSVs for TileDB
+    if(g_measure_iterator_timing_only || g_do_tiledb_merge)
     {
+        tiledb_struct* tiledb_info = &(args->m_tiledb_info);
+        if(g_do_tiledb_merge)
+        {
+#ifdef USE_PRESORTED_ARRAY
+            //clear out previous mappings
+	    for(i=0;i<=tiledb_info->m_max_sample_idx;++i)
+		tiledb_info->m_globally_sorted_sample_info[i].m_reader_idx = -1;
+#endif
+	    tiledb_info->m_num_current_position_samples = 0;
+            //reassign output csv fptrs, if the contig has changed
+            if(tiledb_info->m_current_contig_idx != curr_global_contig_idx)
+            {
+                ASSERT(curr_global_contig_idx >= 0 && curr_global_contig_idx <= tiledb_info->m_max_contig_idx); 
+                for (i=0; i<files->nreaders; ++i)
+                    args->m_idmap.m_readers_map[i].m_csv_output_info.m_csv_out_fptr = 
+                        tiledb_info->m_contig_output_csv[curr_global_contig_idx];
+                tiledb_info->m_current_contig_idx = curr_global_contig_idx;
+#ifdef DEBUG
+		tiledb_info->m_last_global_position = curr_global_position;
+#endif
+            }
+#ifdef DEBUG
+	    ASSERT(curr_global_position >= tiledb_info->m_last_global_position);	//increasing order of positions within a contig
+	    tiledb_info->m_last_global_position = curr_global_position;
+#endif
+        }
         for (i=0; i<files->nreaders; i++)
         {
             bcf_sr_t *reader = &files->readers[i];
             if ( !reader->buffer ) continue;
             int j = 0;
+            bcf_hdr_t* curr_hdr = reader->processed_header;
+            reader_idmap* curr_idmap = &(args->m_idmap.m_readers_map[i]);
             for (j=0; j<=reader->nbuffer; j++)  
             {
                 bcf1_t *line = reader->buffer[j];
                 if(line->pos == pos)
+                {
+                    if(g_do_tiledb_merge)
+                    {
+                        int k = 0;
+                        //Mark so that samples for this line have to write CSV lines
+                        for(k=0;k<bcf_hdr_nsamples(curr_hdr);++k)
+                        {
+                            int global_sample_idx = curr_idmap->m_sqlite_mapping_info.input_sample_idx_2_global_idx[k];
+                            ASSERT(global_sample_idx >= 0 && global_sample_idx <= tiledb_info->m_max_sample_idx);
+#ifdef USE_PRESORTED_ARRAY
+                            tiledb_info->m_globally_sorted_sample_info[global_sample_idx].m_reader_idx = i;
+#else
+			    tiledb_info->m_current_position_samples_array[tiledb_info->m_num_current_position_samples] = 
+				&(tiledb_info->m_globally_sorted_sample_info[global_sample_idx]);
+#endif
+			    ++(tiledb_info->m_num_current_position_samples);
+                        }
+                    }
                     maux->d[i][j].skip |= SKIP_DONE;
+                }
                 else
                     break;
             }
         }
+        if(g_do_tiledb_merge)
+	{
+#ifdef USE_PRESORTED_ARRAY
+            //Iterate over globally sorted sample idx and output lines for those which have valid data
+            for(i=0;i<=tiledb_info->m_max_sample_idx;++i)
+#else
+	    global_samples_struct* tmp_ptr = 0;
+	    switch(tiledb_info->m_num_current_position_samples)
+	    {
+		case 0:
+		case 1:
+		    break;
+		case 2:	//one comparison and swap
+		    if(tiledb_info->m_current_position_samples_array[0]->m_global_sample_idx > 
+			    tiledb_info->m_current_position_samples_array[1]->m_global_sample_idx)
+		    {
+			tmp_ptr = tiledb_info->m_current_position_samples_array[0];
+			tiledb_info->m_current_position_samples_array[0] =
+			    tiledb_info->m_current_position_samples_array[1];
+			tiledb_info->m_current_position_samples_array[1] = tmp_ptr;
+		    }
+		default:
+		    qsort((void*)(tiledb_info->m_current_position_samples_array), tiledb_info->m_num_current_position_samples,
+			    sizeof(global_samples_struct*), compare_global_samples_struct);
+		    break;
+	    }
+	    for(i=0;i<tiledb_info->m_num_current_position_samples;++i)
+#endif
+            {
+#ifdef USE_PRESORTED_ARRAY
+		global_samples_struct* sample_ptr = &(tiledb_info->m_globally_sorted_sample_info[i]);
+#else
+		global_samples_struct* sample_ptr = tiledb_info->m_current_position_samples_array[i];
+#endif
+		int reader_idx = sample_ptr->m_reader_idx;
+#ifdef USE_PRESORTED_ARRAY
+                if(reader_idx >= 0)
+#endif
+                {
+                    bcf_sr_t *reader = &(files->readers[reader_idx]);
+                    ASSERT(reader->buffer);
+                    int j = 0;
+                    bcf_hdr_t* curr_hdr = reader->processed_header;
+                    reader_idmap* curr_idmap = &(args->m_idmap.m_readers_map[reader_idx]);
+                    int input_sample_idx = sample_ptr->m_input_sample_idx;
+		    ASSERT(input_sample_idx >= 0);
+                    for (j=0; j<=reader->nbuffer; j++)  
+                    {
+                        bcf1_t *line = reader->buffer[j];
+                        if(line->pos == pos)
+                            write_csv_line(&(curr_idmap->m_sqlite_mapping_info), &(curr_idmap->m_csv_output_info), curr_hdr, line, input_sample_idx);
+                        else
+                            break;
+                    }
+                }
+            }
+	}
     }
     else
     {
@@ -3262,9 +3397,149 @@ void allocate_original_idmap(args_t* args)
         curr_map->m_num_original_ids = hdr->n[BCF_DT_ID];
         curr_map->m_original_id_2_preprocessed_id = (int*)malloc(curr_map->m_num_original_ids*sizeof(int));
         curr_map->m_original_id_2_preprocessed_copy_id = (int*)malloc(curr_map->m_num_original_ids*sizeof(int));
+	curr_map->m_sample_idx_2_merged_idx = (int*)malloc(bcf_hdr_nsamples(hdr)*sizeof(int));
         //set to invalid value -1
         memset(curr_map->m_original_id_2_preprocessed_id, -1, curr_map->m_num_original_ids*sizeof(int));
         memset(curr_map->m_original_id_2_preprocessed_copy_id, -1, curr_map->m_num_original_ids*sizeof(int));
+	memset(curr_map->m_sample_idx_2_merged_idx, -1, bcf_hdr_nsamples(hdr)*sizeof(int));
+    }
+}
+
+#define MAX_CONTIG_FILENAME_LENGTH 1024
+void setup_tiledb_mapping(args_t* args)
+{
+    int i = 0;
+    bcf_hdr_t* out_hdr = args->out_hdr;
+    //TileDB info 
+    tiledb_struct* tiledb_info = &(args->m_tiledb_info);
+    //invalid current contig idx
+    tiledb_info->m_current_contig_idx = -1;
+    //invalid position
+    tiledb_info->m_last_global_position = -1;
+    //Open Sqlite
+    open_sqlite3_db(tiledb_info->m_sqlite_file, &(tiledb_info->m_sqlite_db)); 
+    tiledb_info->m_merged_sqlite_mapping_info.db = tiledb_info->m_sqlite_db;
+    strcpy(tiledb_info->m_merged_sqlite_mapping_info.sqlite_file, tiledb_info->m_sqlite_file);
+    //Create Sqlite mappings for merged header
+    initialize_samples_contigs_and_fields_idx(&(tiledb_info->m_merged_sqlite_mapping_info), out_hdr);
+    //Find maximum global sample id
+    tiledb_info->m_max_sample_idx = -1;
+    for(i=0;i<out_hdr->n[BCF_DT_SAMPLE];++i)
+    {
+        int64_t global_sample_idx = tiledb_info->m_merged_sqlite_mapping_info.input_sample_idx_2_global_idx[i];
+        ASSERT(global_sample_idx >= 0);
+        if(global_sample_idx > tiledb_info->m_max_sample_idx)
+            tiledb_info->m_max_sample_idx = global_sample_idx;
+    }
+    //Allocate arrays based on max sample idx
+    tiledb_info->m_globally_sorted_sample_info = (global_samples_struct*)malloc((tiledb_info->m_max_sample_idx+1)*
+      sizeof(global_samples_struct));
+    tiledb_info->m_current_position_samples_array = (global_samples_struct**)malloc((tiledb_info->m_max_sample_idx+1)*
+      sizeof(global_samples_struct*));
+    tiledb_info->m_num_current_position_samples = 0;
+    //initialize to invalid
+    for(i=0;i<=tiledb_info->m_max_sample_idx;++i)
+    {
+      tiledb_info->m_globally_sorted_sample_info[i].m_reader_idx = -1;
+      tiledb_info->m_globally_sorted_sample_info[i].m_input_sample_idx = -1;
+      tiledb_info->m_globally_sorted_sample_info[i].m_global_sample_idx = i;
+    }
+    //Find max contig idx in SQL
+    tiledb_info->m_max_contig_idx = -1;
+    for(i=0;i<out_hdr->n[BCF_DT_CTG];++i)
+    {
+        int global_contig_idx = tiledb_info->m_merged_sqlite_mapping_info.input_contig_idx_2_global_idx[i];
+        ASSERT(global_contig_idx >= 0);
+        if(tiledb_info->m_max_contig_idx < global_contig_idx)
+            tiledb_info->m_max_contig_idx = global_contig_idx;
+    }
+    //Create csv fptrs for all contigs - since we have no idea what order contigs appear in the merged VCF
+    tiledb_info->m_contig_output_csv = (FILE**)malloc((tiledb_info->m_max_contig_idx+1)*sizeof(FILE*));
+    char filename[MAX_CONTIG_FILENAME_LENGTH];
+    for(i=0;i<=tiledb_info->m_max_contig_idx;++i)
+    {
+        assert(snprintf(filename, MAX_CONTIG_FILENAME_LENGTH, "%s/%d.csv",tiledb_info->m_output_directory, i) 
+                < MAX_CONTIG_FILENAME_LENGTH);
+        tiledb_info->m_contig_output_csv[i] = fopen(filename,"w");
+        if(tiledb_info->m_contig_output_csv[i] == 0)
+        {
+            fprintf(stderr,"Could not open output TileDB csv file for contigs : %s\n",filename);
+            exit(-1);
+        }
+    }
+    //Obtain Sqlite mappings for input headers
+    for(i=0;i<args->files->nreaders;++i)
+    {
+        bcf_hdr_t* curr_hdr = args->files->readers[i].processed_header;
+        reader_idmap* curr_map = &(args->m_idmap.m_readers_map[i]);
+        curr_map->m_sqlite_mapping_info.db = tiledb_info->m_sqlite_db;
+        strcpy(curr_map->m_sqlite_mapping_info.sqlite_file, tiledb_info->m_sqlite_file);
+        initialize_samples_contigs_and_fields_idx(&(curr_map->m_sqlite_mapping_info), curr_hdr);
+        initialize_csv_output_info(&(curr_map->m_csv_output_info), 0, 16384, 1);
+	int j = 0;
+	//initialize entries in global sample array
+	for(j=0;j<bcf_hdr_nsamples(curr_hdr);++j)
+	{
+	  int64_t global_sample_idx = curr_map->m_sqlite_mapping_info.input_sample_idx_2_global_idx[j];
+	  global_samples_struct* gstruct = &(tiledb_info->m_globally_sorted_sample_info[global_sample_idx]);
+	  gstruct->m_reader_idx = i;
+	  gstruct->m_input_sample_idx = j; 
+	  gstruct->m_global_sample_idx = global_sample_idx;
+	}
+    }
+}
+
+#define MAX_COMMAND_LENGTH 8192
+void cleanup_tiledb_mapping(args_t* args)
+{
+    int i = 0;
+    if(g_do_tiledb_merge)
+    {
+        //TileDB info 
+        tiledb_struct* tiledb_info = &(args->m_tiledb_info);
+        //Sqlite data
+        free_sqlite3_data(&(tiledb_info->m_merged_sqlite_mapping_info));
+	free(tiledb_info->m_current_position_samples_array);
+	free(tiledb_info->m_globally_sorted_sample_info);
+        //Create Sqlite mappings for input headers
+        for(i=0;i<args->files->nreaders;++i)
+        {
+            reader_idmap* curr_map = &(args->m_idmap.m_readers_map[i]);
+            free_csv_output_info(&(curr_map->m_csv_output_info));
+            curr_map->m_sqlite_mapping_info.db = 0; //as the merged sqlite close would have closed the sqlite connection already
+            free_sqlite3_data(&(curr_map->m_sqlite_mapping_info));
+            free_csv_output_info(&(curr_map->m_csv_output_info));
+        }
+        //Close csv files
+        for(i=0;i<=tiledb_info->m_max_contig_idx;++i)
+	{
+            fflush(tiledb_info->m_contig_output_csv[i]);
+            fclose(tiledb_info->m_contig_output_csv[i]);
+	}
+        free(tiledb_info->m_contig_output_csv);
+        //Concatenate csv files to single CSV file, append all contig data to contig 0's file
+        char filename[MAX_CONTIG_FILENAME_LENGTH];
+        char first_filename[MAX_CONTIG_FILENAME_LENGTH];
+        assert(snprintf(first_filename, MAX_CONTIG_FILENAME_LENGTH, "%s/0.csv",tiledb_info->m_output_directory) 
+                < MAX_CONTIG_FILENAME_LENGTH);
+        char command[MAX_COMMAND_LENGTH];
+        for(i=1;i<=tiledb_info->m_max_contig_idx;++i)
+        {
+            assert(snprintf(filename, MAX_CONTIG_FILENAME_LENGTH, "%s/%d.csv",tiledb_info->m_output_directory, i) 
+                    < MAX_CONTIG_FILENAME_LENGTH);
+            assert(snprintf(command, MAX_COMMAND_LENGTH, "cat %s >> %s", filename, first_filename) < MAX_COMMAND_LENGTH);
+            system(command);
+#ifndef DEBUG	//remove other files in non-debug mode
+	    assert(snprintf(command, MAX_COMMAND_LENGTH, "rm -f %s", filename) < MAX_COMMAND_LENGTH);
+            system(command);
+#endif
+        }
+        //Move to final location (if specified)
+        if(args->output_fname && !(strlen(args->output_fname) == 1 && args->output_fname[0] == '-'))
+        {
+            assert(snprintf(command, MAX_COMMAND_LENGTH, "mv %s %s", first_filename, args->output_fname) < MAX_COMMAND_LENGTH);
+            system(command);
+        }
     }
 }
 
@@ -3321,6 +3596,13 @@ void setup_idmap(args_t* args)
             }
             curr_map->m_id_2_merged_id[j] = out_idx;
         }
+	//Samples mapping
+	for(j=0;j<bcf_hdr_nsamples(curr_hdr);++j)
+	{
+	    int merged_sample_idx = bcf_hdr_id2int(out_hdr, BCF_DT_SAMPLE, bcf_hdr_int2id(curr_hdr, BCF_DT_SAMPLE, j));
+	    ASSERT(merged_sample_idx >= 0);
+	    curr_map->m_sample_idx_2_merged_idx[j] = merged_sample_idx;
+	}
     }
     args->m_idmap.m_merged_DP_info_id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, "DP");
     args->m_idmap.m_merged_DP_format_id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, "DP");
@@ -3329,11 +3611,15 @@ void setup_idmap(args_t* args)
     ASSERT(args->m_idmap.m_merged_DP_info_id < 0 || bcf_hdr_idinfo_exists(out_hdr, BCF_HL_INFO, args->m_idmap.m_merged_DP_info_id));
     ASSERT(args->m_idmap.m_merged_DP_info_id < 0 || bcf_hdr_idinfo_exists(out_hdr, BCF_HL_FMT, args->m_idmap.m_merged_DP_info_id));
     args->m_idmap.m_merged_END_info_id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, "END");
+    if(g_do_tiledb_merge)
+        setup_tiledb_mapping(args);
 }
 
 void destroy_idmap(args_t* args)
 {
     int i = 0;
+    if(g_do_tiledb_merge)
+        cleanup_tiledb_mapping(args);
     if(args->m_idmap.m_readers_map)
     {
         for(i=0;i<args->files->nreaders;++i)
@@ -3342,6 +3628,7 @@ void destroy_idmap(args_t* args)
             free(ptr->m_id_2_merged_id);
             free(ptr->m_original_id_2_preprocessed_id);
             free(ptr->m_original_id_2_preprocessed_copy_id);
+	    free(ptr->m_sample_idx_2_merged_idx);
             free(args->m_idmap.m_merged_id_2_reader_idmap[i]);
         }
         free(args->m_idmap.m_readers_map);
@@ -3628,6 +3915,9 @@ enum ArgsIdxEnum
   ARGS_IDX_DO_GATK_MERGE,
   ARGS_IDX_MEASURE_ITERATOR_TIMING,
   ARGS_IDX_COMPUTE_PLMEDIAN,
+  ARGS_IDX_OUTPUT_SORTED_TILEDB_CSV,
+  ARGS_IDX_TILEDB_OUTPUT_DIRECTORY,
+  ARGS_IDX_SQLITE_FILE,
   ARGS_IDX_TAG
 };
 
@@ -3669,6 +3959,9 @@ int main_vcfmerge(int argc, char *argv[])
         {"gatk",0,0,ARGS_IDX_DO_GATK_MERGE},
         {"iterator-timing",0,0,ARGS_IDX_MEASURE_ITERATOR_TIMING},
         {"PLmedian",1,0,ARGS_IDX_COMPUTE_PLMEDIAN},
+        {"output-tiledb-csv",0,0,ARGS_IDX_OUTPUT_SORTED_TILEDB_CSV},
+        {"tiledb-output-dir",1,0,ARGS_IDX_TILEDB_OUTPUT_DIRECTORY},
+        {"sqlite",1,0,ARGS_IDX_SQLITE_FILE},
         {0,0,0,0}
     };
     while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:l:",loptions,NULL)) >= 0) {
@@ -3695,20 +3988,29 @@ int main_vcfmerge(int argc, char *argv[])
                 else if ( !strcmp(optarg,"none") ) args->collapse = COLLAPSE_NONE;
                 else if ( !strcmp(optarg,"id") ) { args->collapse = COLLAPSE_NONE; args->merge_by_id = 1; }
                 else error("The -m type \"%s\" is not recognised.\n", optarg);
-                break;
-            case 'f': args->files->apply_filters = optarg; break;
-            case 'r': args->regions_list = optarg; break;
-            case 'R': args->regions_list = optarg; regions_is_file = 1; break;
-            case  1 : args->header_fname = optarg; break;
-            case  2 : args->header_only = 1; break;
-            case  3 : args->force_samples = 1; break;
-            case ARGS_IDX_MERGE_CONFIG_FILE: parse_merge_config(optarg); break;
-            case ARGS_IDX_REFERENCE_FILE: initialize_reference(args, optarg); break;
-            case ARGS_IDX_INPUT_GVCFS: g_is_input_gvcf = 1; break;
-            case ARGS_IDX_TAG:  args->m_tag = strdup(optarg); break;
-            case ARGS_IDX_DO_GATK_MERGE: g_do_gatk_merge = 1; break;
-            case ARGS_IDX_MEASURE_ITERATOR_TIMING: g_measure_iterator_timing_only = 1; break;
-            case ARGS_IDX_COMPUTE_PLMEDIAN: args->m_plmedian_info.m_output_fptr = fopen(optarg, "w"); break;
+		break;
+	    case 'f': args->files->apply_filters = optarg; break;
+	    case 'r': args->regions_list = optarg; break;
+	    case 'R': args->regions_list = optarg; regions_is_file = 1; break;
+	    case  1 : args->header_fname = optarg; break;
+	    case  2 : args->header_only = 1; break;
+	    case  3 : args->force_samples = 1; break;
+	    case ARGS_IDX_MERGE_CONFIG_FILE: parse_merge_config(optarg); break;
+	    case ARGS_IDX_REFERENCE_FILE: initialize_reference(args, optarg); break;
+	    case ARGS_IDX_INPUT_GVCFS: g_is_input_gvcf = 1; break;
+	    case ARGS_IDX_TAG:  args->m_tag = strdup(optarg); break;
+	    case ARGS_IDX_DO_GATK_MERGE: g_do_gatk_merge = 1; break;
+	    case ARGS_IDX_MEASURE_ITERATOR_TIMING: g_measure_iterator_timing_only = 1; break;
+	    case ARGS_IDX_COMPUTE_PLMEDIAN: args->m_plmedian_info.m_output_fptr = fopen(optarg, "w"); break;
+	    case ARGS_IDX_SQLITE_FILE:
+		args->m_tiledb_info.m_sqlite_file = optarg;
+		break;
+	    case ARGS_IDX_OUTPUT_SORTED_TILEDB_CSV:
+		g_do_tiledb_merge = 1;
+		break;
+	    case ARGS_IDX_TILEDB_OUTPUT_DIRECTORY:
+		args->m_tiledb_info.m_output_directory = optarg;
+		break;
             case 'h': 
             case '?': usage();
             default: error("Unknown argument: %s\n", optarg);
@@ -3718,6 +4020,9 @@ int main_vcfmerge(int argc, char *argv[])
     if ( argc-optind<2 && !args->file_list ) usage();
 
     assert((!g_is_input_gvcf || args->reference_filename) && "To merge gVCFs, you must provide a reference file using --reference=<filename.fa");
+    assert((!g_do_tiledb_merge || args->m_tiledb_info.m_output_directory) && "To produce a sorted CSV file for TileDB, you must provide a directory to store csv files using --tiledb-output-dir=<dir>");
+    assert((!g_do_tiledb_merge || args->m_tiledb_info.m_sqlite_file) && "To produce a sorted CSV file for TileDB, you must provide the path to the samples,contigs and fields sqlite file using --sqlite=<path_to_sqlite_file>");
+
 
     args->files->require_index = 1;
     if ( args->regions_list && bcf_sr_set_regions(args->files, args->regions_list, regions_is_file)<0 )
@@ -3759,16 +4064,7 @@ int main_vcfmerge(int argc, char *argv[])
 #endif
     if(args->m_tag)
         free(args->m_tag);
-    if(args->m_plmedian_info.m_output_fptr)
-    {
-        if(args->m_plmedian_info.m_buffer_len)
-            free(args->m_plmedian_info.m_buffer);
-        if(args->m_plmedian_info.m_median_result_len)
-            free(args->m_plmedian_info.m_median_result);
-        if(args->m_plmedian_info.m_reorg_buffer_len)
-            free(args->m_plmedian_info.m_reorg_buffer);
-        fclose(args->m_plmedian_info.m_output_fptr);
-    }
+    destroy_PLmedian(&(args->m_plmedian_info));
     free(args);
 #ifdef DEBUG
     fclose(g_debug_fptr);

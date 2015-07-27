@@ -37,8 +37,8 @@ THE SOFTWARE.  */
 #include "bcftools.h"
 #include "filter.h"
 #include "htslib/khash_str2int.h"
-#include <sqlite3.h>
 #include <inttypes.h>
+#include <time.h>
 
 #ifdef DEBUG
 #define ASSERT(x)  assert(x)
@@ -79,15 +79,29 @@ typedef struct _args_t
     char *include_types, *exclude_types;
     int include, exclude;
     htsFile *out;
-    FILE* csv_out_fptr;
-    int* input_sample_idx_2_global_idx;
-    int* input_field_idx_2_global_idx;
-    int* input_contig_idx_2_global_idx;
-    uint64_t* input_contig_idx_2_offset;
-    char sqlite_file[1024];
-    sqlite3* db;
+    sqlite_mappings_struct m_mapping_info;
+    plmedian_struct  m_plmedian_info;   //0 in calloc
+    csv_output_struct m_csv_output_info;
+    int m_first_iteration;
+    char* m_query_positions_file;
+    char* m_apply_filters;
 }
 args_t;
+
+void open_sqlite3_db(const char* sqlite_file, sqlite3** db)
+{
+    if(sqlite_file[0] == '\0')
+    {
+	fprintf(stderr, "To print out a TileDB csv file, you must pass the path to the samples and field names sqlite table using the --sqlite argument\n");
+	exit(-1);
+    }
+    if(sqlite3_open(sqlite_file, db) != 0)
+    {
+	fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(*db)); 
+	sqlite3_close(*db);
+	exit(-1);
+    }
+}
 
 static void init_data(args_t *args)
 {
@@ -100,6 +114,9 @@ static void init_data(args_t *args)
         bcf_hdr_append(args->hdr,"##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles in called genotypes\">");
     }
     bcf_hdr_append_version(args->hdr, args->argc, args->argv, "bcftools_view");
+
+    if(args->m_first_iteration == 0)
+	return;
 
     // setup sample data
     if (args->sample_names)
@@ -234,23 +251,8 @@ static void init_data(args_t *args)
     }
     else
     {
-        if(args->sqlite_file[0] == '\0')
-        {
-            fprintf(stderr, "To print out a TileDB csv file, you must pass the path to the samples and field names sqlite table using the --sqlite argument\n");
-            exit(-1);
-        }
-        if(sqlite3_open(args->sqlite_file, &(args->db)) != 0)
-        {
-            fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(args->db)); 
-            sqlite3_close(args->db);
-            exit(-1);
-        }
-        args->csv_out_fptr = args->fn_out ? fopen(args->fn_out, modew) : stdout;
-        if(!(args->csv_out_fptr)) 
-        {
-            error("%s: %s\n", args->fn_out,strerror(errno));
-            exit(-1);
-        }
+	if(args->m_mapping_info.db == 0)
+	    open_sqlite3_db(args->m_mapping_info.sqlite_file, &(args->m_mapping_info.db));
     }
 
     // headers: hdr=full header, hsub=subset header, hnull=sites only header
@@ -272,6 +274,47 @@ static void init_data(args_t *args)
         args->filter = filter_init(args->hdr, args->filter_str);
 }
 
+void initialize_csv_output_info(csv_output_struct* ptr, FILE* output_fptr, unsigned buffer_size, uint8_t reset)
+{
+    if(reset)
+        memset(ptr, 0, sizeof(csv_output_struct));
+    ptr->m_csv_out_fptr = output_fptr;
+    ptr->m_csv_out_buffer.m_buffer = (char*)malloc(buffer_size);
+    ptr->m_csv_out_buffer.m_size = buffer_size;
+    ptr->m_csv_out_buffer.m_offset = 0;
+    ptr->m_htslib_buffer_size = 16384;
+    ptr->m_htslib_buffer = (char*)malloc(16384);
+}
+
+void free_sqlite3_data(sqlite_mappings_struct* mapping_info)
+{
+    if(mapping_info->input_field_idx_2_global_idx)
+	free(mapping_info->input_field_idx_2_global_idx);
+    if(mapping_info->input_sample_idx_2_global_idx)
+	free(mapping_info->input_sample_idx_2_global_idx);
+    if(mapping_info->input_contig_idx_2_global_idx)
+	free(mapping_info->input_contig_idx_2_global_idx);
+    if(mapping_info->input_contig_idx_2_offset)
+	free(mapping_info->input_contig_idx_2_offset);
+    if(mapping_info->db)
+	sqlite3_close(mapping_info->db);
+    memset(mapping_info, 0, sizeof(sqlite_mappings_struct));
+}
+
+void free_csv_output_info(csv_output_struct* ptr)
+{
+    if(ptr->m_csv_out_fptr)
+    {
+        fflush(ptr->m_csv_out_fptr);
+        fclose(ptr->m_csv_out_fptr);
+    }
+    if(ptr->m_csv_out_buffer.m_buffer)
+      free(ptr->m_csv_out_buffer.m_buffer);
+    if(ptr->m_htslib_buffer)
+        free(ptr->m_htslib_buffer);
+    memset(ptr, 0, sizeof(csv_output_struct));
+}
+
 static void destroy_data(args_t *args)
 {
     int i;
@@ -286,16 +329,8 @@ static void destroy_data(args_t *args)
     if ( args->filter )
         filter_destroy(args->filter);
     free(args->ac);
-    if(args->input_field_idx_2_global_idx)
-        free(args->input_field_idx_2_global_idx);
-    if(args->input_sample_idx_2_global_idx)
-        free(args->input_sample_idx_2_global_idx);
-    if(args->input_contig_idx_2_global_idx)
-        free(args->input_contig_idx_2_global_idx);
-    if(args->input_contig_idx_2_offset)
-        free(args->input_contig_idx_2_offset);
-    if(args->db)
-        sqlite3_close(args->db);
+    free_sqlite3_data(&(args->m_mapping_info));
+    free_csv_output_info(&(args->m_csv_output_info));
 }
 
 // true if all samples are phased.
@@ -540,16 +575,16 @@ static void usage(args_t *args)
 
 typedef struct
 {
-  int* input_2_global_idx_array;
   int input_idx;
   uint64_t contig_length;
+  int64_t* input_2_global_idx_array;
   uint64_t* contig_offsets;
 }sqlite_data_struct;
 
 int sqlite_handler(void* ptr, int num_columns, char** field_values, char** column_names)
 {
   assert(num_columns == 1);
-  int global_idx = strtol(field_values[0], 0, 10);
+  int64_t global_idx = strtoll(field_values[0], 0, 10);
   sqlite_data_struct* data = (sqlite_data_struct*)ptr;
   data->input_2_global_idx_array[data->input_idx] = global_idx;
   return 0;
@@ -581,7 +616,9 @@ int max_contig_offset_sqlite_handler(void* ptr, int num_columns, char** field_va
     return 0;
 }
 
-void initialize_samples_contigs_and_fields_idx(args_t* args, bcf_hdr_t* hdr)
+#define ZERO_BASED_POSITION 1
+#define ZERO_BASED_SAMPLE_IDS 1
+void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_info, const bcf_hdr_t* hdr)
 {
     char* error_msg = 0;
     char query_string[4096];
@@ -597,33 +634,36 @@ void initialize_samples_contigs_and_fields_idx(args_t* args, bcf_hdr_t* hdr)
 
     int i = 0;
 
-    args->input_sample_idx_2_global_idx = (int*)malloc(bcf_hdr_nsamples(hdr)*sizeof(int));
-    memset(args->input_sample_idx_2_global_idx, -1, bcf_hdr_nsamples(hdr)*sizeof(int));  //initialize to -1
-    args->input_field_idx_2_global_idx = (int*)malloc(hdr->n[BCF_DT_ID]*sizeof(int));
-    memset(args->input_field_idx_2_global_idx, -1,hdr->n[BCF_DT_ID]*sizeof(int));        //initialize to -1 
-    args->input_contig_idx_2_global_idx = (int*)malloc(hdr->n[BCF_DT_CTG]*sizeof(int));
-    memset(args->input_contig_idx_2_global_idx, -1, hdr->n[BCF_DT_CTG]*sizeof(int));     //initialize to -1
-    args->input_contig_idx_2_offset = (uint64_t*)malloc(hdr->n[BCF_DT_CTG]*sizeof(uint64_t));
+    mapping_info->input_sample_idx_2_global_idx = (int64_t*)malloc(bcf_hdr_nsamples(hdr)*sizeof(int64_t));
+    memset(mapping_info->input_sample_idx_2_global_idx, -1, bcf_hdr_nsamples(hdr)*sizeof(int64_t));  //initialize to -1
+    mapping_info->input_field_idx_2_global_idx = (int64_t*)malloc(hdr->n[BCF_DT_ID]*sizeof(int64_t));
+    memset(mapping_info->input_field_idx_2_global_idx, -1,hdr->n[BCF_DT_ID]*sizeof(int64_t));        //initialize to -1 
+    mapping_info->input_contig_idx_2_global_idx = (int64_t*)malloc(hdr->n[BCF_DT_CTG]*sizeof(int64_t));
+    memset(mapping_info->input_contig_idx_2_global_idx, -1, hdr->n[BCF_DT_CTG]*sizeof(int64_t));     //initialize to -1
+    mapping_info->input_contig_idx_2_offset = (uint64_t*)malloc(hdr->n[BCF_DT_CTG]*sizeof(uint64_t));
 
     //Samples 
-    data.input_2_global_idx_array = args->input_sample_idx_2_global_idx;
+    data.input_2_global_idx_array = mapping_info->input_sample_idx_2_global_idx;
     for(i=0;i<bcf_hdr_nsamples(hdr);++i)
     {
         data.input_idx = i; 
         sprintf(query_string,"select sample_idx from sample_names where sample_names.sample_name == \"%s\";",hdr->samples[i]);
-        sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
+        sqlite3_exec(mapping_info->db, query_string, sqlite_handler, &data, &error_msg);
         if(data.input_2_global_idx_array[i] == -1)
         {
             sprintf(insert_string,"insert into sample_names (sample_name) values( \"%s\" );",hdr->samples[i]);
-            sqlite3_exec(args->db, insert_string, 0, 0, &error_msg);
-            sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
+            sqlite3_exec(mapping_info->db, insert_string, 0, 0, &error_msg);
+            sqlite3_exec(mapping_info->db, query_string, sqlite_handler, &data, &error_msg);
             assert(data.input_2_global_idx_array[i] >= 0);
         }
+#ifdef ZERO_BASED_SAMPLE_IDS
+        --(mapping_info->input_sample_idx_2_global_idx[i]);
+#endif
     }
 
     //Contigs
-    data.input_2_global_idx_array = args->input_contig_idx_2_global_idx;
-    data.contig_offsets = args->input_contig_idx_2_offset;
+    data.input_2_global_idx_array = mapping_info->input_contig_idx_2_global_idx;
+    data.contig_offsets = mapping_info->input_contig_idx_2_offset;
     for(i=0;i<hdr->n[BCF_DT_CTG];++i)
     {
         uint64_t curr_contig_length = bcf_hdr_id2contig_length(hdr, i);
@@ -632,21 +672,21 @@ void initialize_samples_contigs_and_fields_idx(args_t* args, bcf_hdr_t* hdr)
         data.input_idx = i; 
         sprintf(query_string,"select contig_idx,contig_length,contig_offset from contig_names where contig_names.contig_name == \"%s\";",
                 bcf_hdr_int2id(hdr, BCF_DT_CTG, i));
-        sqlite3_exec(args->db, query_string, contig_sqlite_handler, &data, &error_msg);
+        sqlite3_exec(mapping_info->db, query_string, contig_sqlite_handler, &data, &error_msg);
         //why the retry?
         //the schema forces contig_offset to have unique values, if multiple inserts are tried in parallel, only one will succeed 
         while(data.input_2_global_idx_array[i] == -1)
         {
             //get max offset value from SQL
-            sqlite3_exec(args->db, max_contig_offset_query, max_contig_offset_sqlite_handler, &max_contig, &error_msg);
+            sqlite3_exec(mapping_info->db, max_contig_offset_query, max_contig_offset_sqlite_handler, &max_contig, &error_msg);
             //Compute offset for new entry and insert
             sprintf(insert_string,"insert into contig_names (contig_name, contig_length, contig_offset) values( \"%s\",%" PRIu64 ",%" PRIu64 " );",
                     bcf_hdr_int2id(hdr, BCF_DT_CTG, i), curr_contig_length, max_contig.contig_offset + max_contig.contig_length);
             error_msg = 0;
             //May fail because of parallel insert
-            if(sqlite3_exec(args->db, insert_string, 0, 0, &error_msg) == SQLITE_OK)
+            if(sqlite3_exec(mapping_info->db, insert_string, 0, 0, &error_msg) == SQLITE_OK)
             {
-                sqlite3_exec(args->db, query_string, contig_sqlite_handler, &data, &error_msg);
+                sqlite3_exec(mapping_info->db, query_string, contig_sqlite_handler, &data, &error_msg);
                 assert(data.input_2_global_idx_array[i] >= 0);
             }
             else
@@ -657,32 +697,40 @@ void initialize_samples_contigs_and_fields_idx(args_t* args, bcf_hdr_t* hdr)
     }
 
     //INFO/FILTER/FORMAT fields
-    data.input_2_global_idx_array = args->input_field_idx_2_global_idx;
+    data.input_2_global_idx_array = mapping_info->input_field_idx_2_global_idx;
     for(i=0;i<hdr->n[BCF_DT_ID];++i)
     {
         data.input_idx = i; 
         sprintf(query_string,"select field_idx from field_names where field_names.field_name == \"%s\";",bcf_hdr_int2id(hdr, BCF_DT_ID, i));
-        sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
+        sqlite3_exec(mapping_info->db, query_string, sqlite_handler, &data, &error_msg);
         if(data.input_2_global_idx_array[i] == -1)
         {
             sprintf(insert_string,"insert into field_names (field_name) values( \"%s\" );",bcf_hdr_int2id(hdr, BCF_DT_ID, i));
-            sqlite3_exec(args->db, insert_string, 0, 0, &error_msg);
-            sqlite3_exec(args->db, query_string, sqlite_handler, &data, &error_msg);
+            sqlite3_exec(mapping_info->db, insert_string, 0, 0, &error_msg);
+            sqlite3_exec(mapping_info->db, query_string, sqlite_handler, &data, &error_msg);
             assert(data.input_2_global_idx_array[i] >= 0);
         }
     }
 }
 
 #define CSV_MISSING_CHARACTER '#'
-void write_csv_line(args_t* args, bcf_hdr_t* out_hdr, bcf1_t* line, char** buffer, int* buffer_size)
+#define CSV_NON_REF_REPRESENTATION "&"
+int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_output_info,
+	bcf_hdr_t* out_hdr, bcf1_t* line, int input_sample_idx)
 {
-    FILE* csv_fptr = args->csv_out_fptr;
-    int i = 0;
-    bcf_unpack(line, BCF_UN_ALL);
+    //Buffer to write CSV line
+    buffer_wrapper* csv_out_buffer = &(csv_output_info->m_csv_out_buffer);
+    //Sampling info
+    random_sampling_struct* sampling_info = SHOULD_DO_SAMPLING(csv_output_info->m_sampling_info) ? &(csv_output_info->m_sampling_info) : 0 ;
+    //Profiling info
+    gvcf_stat_struct* profile_intervals = SHOULD_DO_PROFILING(csv_output_info->m_profile_intervals) ? &(csv_output_info->m_profile_intervals) : 0; 
+    //Buffer to use to call get_info/format_values()
+    char** buffer = &(csv_output_info->m_htslib_buffer);
+    unsigned* buffer_size = &(csv_output_info->m_htslib_buffer_size);
+
     int contig_id = line->rid;
-    ASSERT(args->input_contig_idx_2_global_idx[contig_id] >= 0);
-    uint64_t contig_offset = args->input_contig_idx_2_offset[contig_id];
-    for(i=0;i<bcf_hdr_nsamples(out_hdr);++i)
+    ASSERT(mapping_info->input_contig_idx_2_global_idx[contig_id] >= 0);
+    uint64_t contig_offset = mapping_info->input_contig_idx_2_offset[contig_id];
     {
         int num_values = -1;
 #define PRINT_TILEDB_CSV(field_name, bcf_ht_type, get_function, type_t, format_specifier, vector_end_condition, missing_condition)       \
@@ -692,7 +740,7 @@ void write_csv_line(args_t* args, bcf_hdr_t* out_hdr, bcf1_t* line, char** buffe
             if(num_elements*sizeof(type_t) > (*buffer_size)) \
                 (*buffer_size) = num_elements*sizeof(type_t); \
             if(num_values < 0) \
-                fprintf(csv_fptr,",%c",CSV_MISSING_CHARACTER);  \
+                TILEDB_CSV_BPRINTF(csv_out_buffer,",%c",CSV_MISSING_CHARACTER)  \
             else \
             { \
                 int k = 0;  \
@@ -700,53 +748,98 @@ void write_csv_line(args_t* args, bcf_hdr_t* out_hdr, bcf1_t* line, char** buffe
                 for(k=0;k<num_values;++k)   \
                 {   \
                     type_t val = ptr[k];    \
-                    fprintf(csv_fptr,","); \
+                    TILEDB_CSV_BPRINTF(csv_out_buffer,",") \
                     if(missing_condition) \
                         continue; \
-                    fprintf(csv_fptr,format_specifier,val);  \
+                    TILEDB_CSV_BPRINTF(csv_out_buffer,format_specifier,val)  \
                 }   \
             } \
         }
         //Print co-ordinates : sample id, location
-        ASSERT(args->input_sample_idx_2_global_idx[i] >= 0);
-        ASSERT(args->input_sample_idx_2_global_idx[i] >= 0);
+        ASSERT(mapping_info->input_sample_idx_2_global_idx[input_sample_idx] >= 0);
+#ifdef ZERO_BASED_POSITION
+        uint64_t position = contig_offset + ((uint64_t)line->pos);
+#else
         uint64_t position = contig_offset + ((uint64_t)line->pos) + 1;
-        fprintf(csv_fptr,"%d,%"PRIu64, args->input_sample_idx_2_global_idx[i], position);
-        //print END position
+#endif
+	if(sampling_info)
+	{
+	    int random_value = rand();
+	    if(random_value < sampling_info->m_sampling_limit)
+		fprintf(sampling_info->m_spit_random_positions,"%"PRIu64"\n",position);
+	    return 0;
+	}
+	uint64_t global_end_position = 0;
+        //get END position
         {
             int num_elements = (*buffer_size)/sizeof(int);
             int num_values = bcf_get_info_values(out_hdr, line, "END", (void**)buffer, &num_elements, BCF_HT_INT);
             if(num_values < 0)
-                fprintf(csv_fptr,",%"PRIu64,position);    //same as position
+		global_end_position = position;
             else
             {
                 int end_pos = ((int*)(*buffer))[0];
-                fprintf(csv_fptr,",%"PRIu64, contig_offset + ((uint64_t)end_pos));
+#ifdef ZERO_BASED_POSITION
+                --end_pos;
+#endif
+		global_end_position = contig_offset + ((uint64_t)end_pos);
             }
         }
+	if(profile_intervals)
+	{
+	    uint64_t interval_length = (global_end_position - position + 1);
+	    profile_intervals->m_num_valid_positions += interval_length;
+	    profile_intervals->m_sum_sq_valid_interval_length += (interval_length*interval_length);
+	    if(interval_length > profile_intervals->m_max_valid_interval_length)
+		profile_intervals->m_max_valid_interval_length = interval_length;
+	    ++(profile_intervals->m_num_valid_intervals);
+	    uint64_t last_invalid_interval_length = position - profile_intervals->m_last_valid_interval_end - 1;
+	    profile_intervals->m_last_valid_interval_end = global_end_position;
+	    if(last_invalid_interval_length > 0)
+	    {
+		profile_intervals->m_num_invalid_positions += last_invalid_interval_length;
+		profile_intervals->m_sum_sq_invalid_interval_length += (last_invalid_interval_length*last_invalid_interval_length);
+		if(last_invalid_interval_length > profile_intervals->m_max_invalid_interval_length)
+		    profile_intervals->m_max_invalid_interval_length = last_invalid_interval_length;
+		++(profile_intervals->m_num_invalid_intervals);
+	    }
+	    if(profile_intervals->m_max_position < position)
+		profile_intervals->m_max_position = position;
+	    return 0;
+	}
+        csv_out_buffer->m_global_sample_idx = mapping_info->input_sample_idx_2_global_idx[input_sample_idx];
+        csv_out_buffer->m_global_start_position = position;
+        csv_out_buffer->m_global_end_position = global_end_position;
+        if(!(csv_output_info->m_skip_coordinates))
+        {
+            //print sample idx and position
+            TILEDB_CSV_BPRINTF(csv_out_buffer,"%"PRIi64",%"PRIu64, mapping_info->input_sample_idx_2_global_idx[input_sample_idx], position)
+            //print END position
+            TILEDB_CSV_BPRINTF(csv_out_buffer,",%"PRIu64, global_end_position)
+        }
         //print reference allele and number of ALT alleles
-        fprintf(csv_fptr,",%s,%d", line->d.allele[0], line->n_allele-1);
+        TILEDB_CSV_BPRINTF(csv_out_buffer,",%s,%d", line->d.allele[0], line->n_allele-1)
         //print alt alleles
         int j = 0;
         for(j=1;j<line->n_allele;++j)
         {
             if(strcmp(line->d.allele[j],"<NON_REF>") == 0)
-                fprintf(csv_fptr,",&");
+                TILEDB_CSV_BPRINTF(csv_out_buffer,",%s",CSV_NON_REF_REPRESENTATION)
             else
-                fprintf(csv_fptr,",%s",line->d.allele[j]);
+                TILEDB_CSV_BPRINTF(csv_out_buffer,",%s",line->d.allele[j])
         }
         //print QUAL
         if(bcf_float_is_missing(line->qual))
-            fprintf(csv_fptr,",%c",CSV_MISSING_CHARACTER);
+            TILEDB_CSV_BPRINTF(csv_out_buffer,",%c",CSV_MISSING_CHARACTER)
         else
-            fprintf(csv_fptr,",%0.3f",line->qual);
+            TILEDB_CSV_BPRINTF(csv_out_buffer,",%0.3f",line->qual)
         //print number of filters, followed by filter idx
-        fprintf(csv_fptr,",%d",line->d.n_flt);
+        TILEDB_CSV_BPRINTF(csv_out_buffer,",%d",line->d.n_flt)
         for(j=0;j<line->d.n_flt;++j)
         {
             ASSERT(line->d.flt[j] >= 0 && line->d.flt[j] < out_hdr->n[BCF_DT_ID]);
-            ASSERT(args->input_field_idx_2_global_idx[line->d.flt[j]] >= 0);
-            fprintf(csv_fptr,",%d",args->input_field_idx_2_global_idx[line->d.flt[j]]);
+            ASSERT(mapping_info->input_field_idx_2_global_idx[line->d.flt[j]] >= 0);
+            TILEDB_CSV_BPRINTF(csv_out_buffer,",%"PRIi64,mapping_info->input_field_idx_2_global_idx[line->d.flt[j]])
         }
         //Print relevant INFO fields
         PRINT_TILEDB_CSV("BaseQRankSum",BCF_HT_REAL, bcf_get_info_values, float,"%.2f",0,(bcf_float_is_missing(val)));
@@ -762,19 +855,52 @@ void write_csv_line(args_t* args, bcf_hdr_t* out_hdr, bcf1_t* line, char** buffe
         PRINT_TILEDB_CSV("GQ",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
         PRINT_TILEDB_CSV("SB",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
         if(num_values < 0)
-            fprintf(csv_fptr,",%c,%c,%c",CSV_MISSING_CHARACTER, CSV_MISSING_CHARACTER, CSV_MISSING_CHARACTER);
+            TILEDB_CSV_BPRINTF(csv_out_buffer,",%c,%c,%c",CSV_MISSING_CHARACTER, CSV_MISSING_CHARACTER, CSV_MISSING_CHARACTER)
         PRINT_TILEDB_CSV("AD",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
         if(num_values < 0)
           for(j=0;j<line->n_allele-1;++j)       //missing values for N-1 alleles, as PRINT_TILEDB_CSV would have added one missing char
-            fprintf(csv_fptr,",%c",CSV_MISSING_CHARACTER);
+            TILEDB_CSV_BPRINTF(csv_out_buffer,",%c",CSV_MISSING_CHARACTER)
         PRINT_TILEDB_CSV("PL",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
+        if(num_values < 0)
+        {
+          int num_gts =(line->n_allele*(line->n_allele+1))/2;
+          for(j=0;j<num_gts-1;++j)//missing values for N-1 GTs, as PRINT_TILEDB_CSV would have added one missing char
+            TILEDB_CSV_BPRINTF(csv_out_buffer,",%c",CSV_MISSING_CHARACTER)
+        }
     }
-    fprintf(csv_fptr,"\n");
+    TILEDB_CSV_BPRINTF(csv_out_buffer,"\n")
+    unsigned curr_offset = csv_out_buffer->m_offset; 
+    //Check if need to write to stream
+    FILE* csv_fptr = csv_output_info->m_csv_out_fptr;
+    if(csv_fptr)
+    {
+      fputs(csv_out_buffer->m_buffer, csv_fptr);
+      csv_out_buffer->m_offset = 0;
+    }
+    return curr_offset;
+}
+
+void write_csv_for_one_VCF_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_output_info,
+	bcf_hdr_t* out_hdr, bcf1_t* line)
+{
+    int i = 0;
+    bcf_unpack(line, BCF_UN_ALL);
+    if(SHOULD_DO_SAMPLING(csv_output_info->m_sampling_info) || SHOULD_DO_PROFILING(csv_output_info->m_profile_intervals))
+	write_csv_line(mapping_info, csv_output_info, out_hdr, line, 0);
+    else
+	for(i=0;i<bcf_hdr_nsamples(out_hdr);++i)
+	    write_csv_line(mapping_info, csv_output_info, out_hdr, line, i);
 }
 
 enum ArgsIdxEnum
 {
   ARGS_IDX_SQLITE_FILE=10000,
+  ARGS_IDX_COMPUTE_PLMEDIAN,
+  ARGS_IDX_SPIT_RANDOM_POSITIONS,
+  ARGS_IDX_NUM_RANDOM_POSITIONS,
+  ARGS_IDX_NUM_LINES_IN_VCF,
+  ARGS_IDX_QUERY_POSITIONS_FILE,
+  ARGS_IDX_PROFILE_GVCF_INTERVALS,
   ARGS_IDX_TAG
 };
 
@@ -784,13 +910,13 @@ int main_vcfview(int argc, char *argv[])
     int c;
     args_t *args  = (args_t*) calloc(1,sizeof(args_t));
     args->argc    = argc; args->argv = argv;
-    args->files   = bcf_sr_init();
     args->clevel  = -1;
     args->print_header = 1;
     args->update_info = 1;
     args->output_type = FT_VCF;
     int targets_is_file = 0, regions_is_file = 0;
-
+    random_sampling_struct* sampling_info = &(args->m_csv_output_info.m_sampling_info);
+    gvcf_stat_struct* profile_intervals = &(args->m_csv_output_info.m_profile_intervals);
     static struct option loptions[] =
     {
         {"genotype",1,0,'g'},
@@ -829,6 +955,12 @@ int main_vcfview(int argc, char *argv[])
         {"phased",0,0,'p'},
         {"exclude-phased",0,0,'P'},
         {"sqlite",1,0,ARGS_IDX_SQLITE_FILE},
+        {"PLmedian",1,0,ARGS_IDX_COMPUTE_PLMEDIAN},
+        {"spit-random-positions",1,0,ARGS_IDX_SPIT_RANDOM_POSITIONS},
+        {"num-random-positions",1,0,ARGS_IDX_NUM_RANDOM_POSITIONS},
+        {"num-lines",1,0,ARGS_IDX_NUM_LINES_IN_VCF},
+        {"query-positions-file",1,0,ARGS_IDX_QUERY_POSITIONS_FILE},
+	{"profile-gvcf-intervals",0,0,ARGS_IDX_PROFILE_GVCF_INTERVALS},
         {0,0,0,0}
     };
     while ((c = getopt_long(argc, argv, "l:t:T:r:R:o:O:s:S:Gf:knv:V:m:M:auUhHc:C:Ii:e:xXpPq:Q:g:",loptions,NULL)) >= 0)
@@ -866,7 +998,7 @@ int main_vcfview(int argc, char *argv[])
             case 'I': args->update_info = 0; break;
             case 'G': args->sites_only = 1; break;
 
-            case 'f': args->files->apply_filters = optarg; break;
+            case 'f': args->m_apply_filters = optarg; break;
             case 'k': args->known = 1; break;
             case 'n': args->novel = 1; break;
             case 'm': args->min_alleles = atoi(optarg); break;
@@ -931,8 +1063,30 @@ int main_vcfview(int argc, char *argv[])
                 break;
             }
             case ARGS_IDX_SQLITE_FILE:
-                strcpy(args->sqlite_file, optarg);
+                strcpy(args->m_mapping_info.sqlite_file, optarg);
                 break;
+            case ARGS_IDX_COMPUTE_PLMEDIAN:
+		args->m_plmedian_info.m_output_fptr = fopen(optarg, "w");
+		args->print_header = 0;
+		break;
+	    case ARGS_IDX_SPIT_RANDOM_POSITIONS:
+		sampling_info->m_spit_random_positions = fopen(optarg, "w");
+		assert(sampling_info->m_spit_random_positions);
+		args->print_header = 0;
+		break;
+	    case ARGS_IDX_NUM_RANDOM_POSITIONS:
+		sampling_info->m_num_random_positions = strtoll(optarg, 0, 10);
+		break;
+	    case ARGS_IDX_NUM_LINES_IN_VCF:
+		sampling_info->m_num_lines_in_vcf = strtoll(optarg, 0, 10);
+		break;
+	    case ARGS_IDX_QUERY_POSITIONS_FILE:
+		args->m_query_positions_file = optarg;
+		regions_is_file = 0;
+		break;
+	    case ARGS_IDX_PROFILE_GVCF_INTERVALS:
+		profile_intervals->m_do_profiling = 1;
+		break;
             case '?': usage(args);
             default: error("Unknown argument: %s\n", optarg);
         }
@@ -953,65 +1107,136 @@ int main_vcfview(int argc, char *argv[])
     }
     else fname = argv[optind];
 
-    // read in the regions from the command line
-    if ( args->regions_list )
+    FILE* query_fptr = args->m_query_positions_file ? fopen(args->m_query_positions_file, "r") : 0;
+    assert(args->m_query_positions_file == 0 || query_fptr);
+    char* query_line = 0;
+    size_t query_line_size = 0;
+    args->m_first_iteration = 1;
+    do
     {
-        if ( bcf_sr_set_regions(args->files, args->regions_list, regions_is_file)<0 )
-            error("Failed to read the regions: %s\n", args->regions_list);
-    }
-    else if ( optind+1 < argc )
-    {
-        int i;
-        kstring_t tmp = {0,0,0};
-        kputs(argv[optind+1],&tmp);
-        for (i=optind+2; i<argc; i++) { kputc(',',&tmp); kputs(argv[i],&tmp); }
-        if ( bcf_sr_set_regions(args->files, tmp.s, 0)<0 )
-            error("Failed to read the regions: %s\n", tmp.s);
-        free(tmp.s);
-    }
-    if ( args->targets_list )
-    {
-        if ( bcf_sr_set_targets(args->files, args->targets_list, targets_is_file, 0)<0 )
-            error("Failed to read the targets: %s\n", args->targets_list);
-    }
+	if(query_fptr)
+	{
+	    getline(&query_line, &query_line_size, query_fptr);
+	    if(feof(query_fptr))
+		break;
+	    if(query_line[strlen(query_line)-1] == '\n')
+		query_line[strlen(query_line)-1] = '\0';
+	    args->regions_list = query_line;
+	}
+	args->files   = bcf_sr_init();
+	if(args->m_apply_filters)
+	    args->files->apply_filters = args->m_apply_filters;
+	// read in the regions from the command line
+	if ( args->regions_list )
+	{
+	    if ( bcf_sr_set_regions(args->files, args->regions_list, regions_is_file)<0 )
+		error("Failed to read the regions: %s\n", args->regions_list);
+	}
+	else if ( optind+1 < argc )
+	{
+	    int i;
+	    kstring_t tmp = {0,0,0};
+	    kputs(argv[optind+1],&tmp);
+	    for (i=optind+2; i<argc; i++) { kputc(',',&tmp); kputs(argv[i],&tmp); }
+	    if ( bcf_sr_set_regions(args->files, tmp.s, 0)<0 )
+		error("Failed to read the regions: %s\n", tmp.s);
+	    free(tmp.s);
+	}
+	if ( args->targets_list )
+	{
+	    if ( bcf_sr_set_targets(args->files, args->targets_list, targets_is_file, 0)<0 )
+		error("Failed to read the targets: %s\n", args->targets_list);
+	}
 
-    if ( !bcf_sr_add_reader(args->files, fname) ) error("Failed to open %s: %s\n", fname,bcf_sr_strerror(args->files->errnum));
+	if ( !bcf_sr_add_reader(args->files, fname) ) error("Failed to open %s: %s\n", fname,bcf_sr_strerror(args->files->errnum));
 
-    init_data(args);
+	init_data(args);
 
-    bcf_hdr_t *out_hdr = args->hnull ? args->hnull : (args->hsub ? args->hsub : args->hdr);
-    initialize_samples_contigs_and_fields_idx(args, out_hdr);
-    if (args->print_header)
-        bcf_hdr_write(args->out, out_hdr);
-    else if ( args->output_type & FT_BCF )
-        error("BCF output requires header, cannot proceed with -H\n");
-    if (!args->header_only)
-    {
-        int buffer_size = 4096;
-        char* buffer = (char*)malloc(buffer_size*sizeof(char));
-        while ( bcf_sr_next_line(args->files) )
+	bcf_hdr_t *out_hdr = args->hnull ? args->hnull : (args->hsub ? args->hsub : args->hdr);
+	if(args->output_type == FT_TILEDB_CSV && args->m_mapping_info.input_sample_idx_2_global_idx == 0)
         {
-            bcf1_t *line = args->files->readers[0].buffer[0];
-            if ( line->errcode && out_hdr!=args->hdr ) error("Undefined tags in the header, cannot proceed in the sample subset mode.\n");
-            if ( subset_vcf(args, line) )
-            {
-                if(args->output_type & FT_TILEDB_CSV)
-                    write_csv_line(args, out_hdr, line, &buffer, &buffer_size);
-                else
-                    bcf_write1(args->out, out_hdr, line);
-            }
+            initialize_samples_contigs_and_fields_idx(&(args->m_mapping_info), out_hdr);
+            initialize_csv_output_info(&(args->m_csv_output_info), args->fn_out ? fopen(args->fn_out, "w") : stdout, 16384, 0);
         }
-        free(buffer);
-    }
-    if(args->output_type & FT_TILEDB_CSV)
+	if (args->print_header)
+	    bcf_hdr_write(args->out, out_hdr);
+	else if ( args->output_type & FT_BCF )
+	    error("BCF output requires header, cannot proceed with -H\n");
+	if(sampling_info->m_spit_random_positions)
+	{
+	    srand(0x55301b7d);	//random seed
+	    assert(sampling_info->m_num_random_positions > 0);
+	    assert(sampling_info->m_num_lines_in_vcf > 0);
+	    sampling_info->m_sampling_limit = RAND_MAX;
+	    sampling_info->m_sampling_limit = 
+		(sampling_info->m_sampling_limit * sampling_info->m_num_random_positions)/sampling_info->m_num_lines_in_vcf;
+	    assert(sampling_info->m_sampling_limit <= RAND_MAX);
+	}
+	if (!args->header_only)
+	{
+	    while ( bcf_sr_next_line(args->files) )
+	    {
+		bcf1_t *line = args->files->readers[0].buffer[0];
+		if ( line->errcode && out_hdr!=args->hdr ) error("Undefined tags in the header, cannot proceed in the sample subset mode.\n");
+		if ( subset_vcf(args, line) )
+		{
+		    if(args->output_type & FT_TILEDB_CSV)	//CSV format
+		    {
+			if(args->m_plmedian_info.m_output_fptr)	//Query PLmedians
+			{
+			    int veclen = compute_PLmedian(out_hdr, line,
+				    &(args->m_plmedian_info.m_median_result), &(args->m_plmedian_info.m_median_result_len),
+				    &(args->m_plmedian_info.m_buffer), &(args->m_plmedian_info.m_buffer_len),
+				    &(args->m_plmedian_info.m_reorg_buffer), &(args->m_plmedian_info.m_reorg_buffer_len));
+			    print_PLmedian(args->m_plmedian_info.m_output_fptr, out_hdr, line,
+				    args->m_plmedian_info.m_median_result, veclen);
+			}
+			else
+			    write_csv_for_one_VCF_line(&(args->m_mapping_info), &(args->m_csv_output_info), out_hdr, line);
+		    }
+		    else	//VCF/BCF format
+		    {
+			if(sampling_info->m_spit_random_positions)
+			{
+			    int random_value = rand();
+			    if(random_value < sampling_info->m_sampling_limit)
+				fprintf(sampling_info->m_spit_random_positions,"%s\t%d\n",bcf_hdr_id2name(out_hdr,line->rid),line->pos+1); //since line->pos is 0 based, but VCF expects 1 based
+			}
+			else
+			    bcf_write1(args->out, out_hdr, line);
+		    }
+		}
+	    }
+	}
+	if(!(args->output_type & FT_TILEDB_CSV))
+	    hts_close(args->out);
+	if(sampling_info->m_spit_random_positions)
+	    fclose(sampling_info->m_spit_random_positions);
+	bcf_sr_destroy(args->files);
+	args->m_first_iteration = 0;
+    } while(args->m_query_positions_file && !feof(query_fptr));
+    if(profile_intervals->m_do_profiling)
     {
-        fflush(args->csv_out_fptr);
-        fclose(args->csv_out_fptr);
+	/*printf("mean valid interval length,mean invalid interval length,,max valid interval length,max invalid interval length,,std-dev valid interval length,std-dev invalid interval length\n");*/
+	double mean_valid_interval_length = ((double)profile_intervals->m_num_valid_positions)/profile_intervals->m_num_valid_intervals;
+	double stddev_valid_interval_length = sqrt(((double)profile_intervals->m_sum_sq_valid_interval_length)/profile_intervals->m_num_valid_intervals - mean_valid_interval_length*mean_valid_interval_length);
+	double mean_invalid_interval_length = ((double)profile_intervals->m_num_invalid_positions)/profile_intervals->m_num_invalid_intervals;
+	double stddev_invalid_interval_length = sqrt(((double)profile_intervals->m_sum_sq_invalid_interval_length)/profile_intervals->m_num_invalid_intervals - mean_invalid_interval_length*mean_invalid_interval_length);
+	printf("%.2lf,%2.lf,,%"PRIu64",%"PRIu64",,%.2lf,%.2lf\n",mean_valid_interval_length, mean_invalid_interval_length,
+		profile_intervals->m_max_valid_interval_length, profile_intervals->m_max_invalid_interval_length,
+		stddev_valid_interval_length,stddev_invalid_interval_length);
+
+	/*printf("Max genomic positions: %" PRIu64 "\nNum positions with valid genomic data: %"PRIu64"\nNum valid intervals: %"PRIu64"\n",*/
+	/*profile_intervals->m_max_position, profile_intervals->m_num_valid_positions, profile_intervals->m_num_valid_intervals);*/
+	/*printf("Num positions with no valid genomic data: %"PRIu64"\nNum invalid intervals: %"PRIu64"\n",*/
+	/*profile_intervals->m_num_invalid_positions, profile_intervals->m_num_invalid_intervals);*/
     }
-    else
-        hts_close(args->out);
     destroy_data(args);
-    bcf_sr_destroy(args->files);
+    destroy_PLmedian(&(args->m_plmedian_info));
+    if(query_line)
+	free(query_line);
+    if(query_fptr)
+	fclose(query_fptr);
     free(args);
     return 0;
 }

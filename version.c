@@ -44,4 +44,9 @@ void error(const char *format, ...)
     exit(-1);
 }
 
+char *bcftools_version(void)
+{
+    return BCFTOOLS_VERSION;
+}
+
 

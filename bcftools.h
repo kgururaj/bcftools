@@ -36,15 +36,20 @@ THE SOFTWARE.  */
 #define FT_STDIN (1<<3)
 #define FT_TILEDB_CSV (1<<4)
 
-char *bcftools_version(void);
-void error(const char *format, ...);
-void bcf_hdr_append_version(bcf_hdr_t *hdr, int argc, char **argv, const char *cmd);
-const char *hts_bcf_wmode(int file_type);
-
-void *smalloc(size_t size);     // safe malloc
-
-static inline char gt2iupac(char a, char b)
+#ifdef __cplusplus
+extern "C"
 {
+#endif
+
+  char *bcftools_version(void);
+  void error(const char *format, ...);
+  void bcf_hdr_append_version(bcf_hdr_t *hdr, int argc, char **argv, const char *cmd);
+  const char *hts_bcf_wmode(int file_type);
+
+  void *smalloc(size_t size);     // safe malloc
+
+  static inline char gt2iupac(char a, char b)
+  {
     static const char iupac[4][4] = { {'A','M','R','W'},{'M','C','S','Y'},{'R','S','G','K'},{'W','Y','K','T'} };
     if ( a>='a' ) a -= 'a' - 'A';
     if ( b>='a' ) b -= 'a' - 'A';
@@ -59,6 +64,137 @@ static inline char gt2iupac(char a, char b)
     else if ( b=='T' ) b = 3;
     else return 'N';
     return iupac[(int)a][(int)b];
-}
+  }
 
+  //calloc on args_t sets everything to 0
+  typedef struct
+  {
+    FILE* m_output_fptr;
+    int* m_median_result;
+    int m_median_result_len;
+    int* m_buffer;
+    int m_buffer_len;
+    int* m_reorg_buffer;
+    int m_reorg_buffer_len;
+  }plmedian_struct;
+
+  //Median of PL functions
+  int compute_PLmedian(bcf_hdr_t* hdr, bcf1_t* line, int** median_result, int* median_result_len,
+      int** buffer, int* buffer_len,
+      int** reorg_buffer, int* reorg_buffer_len);
+  void print_PLmedian(FILE* fptr, bcf_hdr_t* hdr, bcf1_t* line, int* median_result, int median_result_len);
+  void destroy_PLmedian(plmedian_struct* info);
+
+  //TileDB functions and structures
+#include <sqlite3.h>
+  typedef struct
+  {
+    unsigned m_offset;
+    unsigned m_size;
+    char* m_buffer;
+    uint64_t m_global_sample_idx;
+    uint64_t m_global_start_position;
+    uint64_t m_global_end_position;
+  } buffer_wrapper;
+
+#define TILEDB_CSV_BPRINTF(buffer, ...) \
+  { \
+    int buffer_space_available = buffer->m_size - buffer->m_offset; \
+    int num_chars_printed = snprintf(buffer->m_buffer+buffer->m_offset, buffer_space_available, __VA_ARGS__); \
+    if(num_chars_printed >= buffer_space_available) \
+    { \
+      fprintf(stderr, "TileDB CSV line too long - exiting :(\n"); \
+      exit(-1); \
+    } \
+    buffer->m_offset += num_chars_printed; \
+  }
+
+  typedef struct
+  {
+  
+    int64_t* input_sample_idx_2_global_idx;
+    int64_t* input_field_idx_2_global_idx;
+    int64_t* input_contig_idx_2_global_idx;
+    uint64_t* input_contig_idx_2_offset;
+    char sqlite_file[1024];
+    sqlite3* db;
+  }sqlite_mappings_struct;
+
+  typedef struct
+  {
+    int m_input_sample_idx;
+    int m_reader_idx;
+    int64_t m_global_sample_idx;
+  }global_samples_struct;
+
+  typedef struct
+  {
+    int m_max_contig_idx;
+    int m_max_sample_idx;
+    int m_current_contig_idx;
+    sqlite_mappings_struct m_merged_sqlite_mapping_info;
+    int64_t m_last_global_position;
+    char* m_output_directory;
+    FILE** m_contig_output_csv; //1 file per contig
+    char* m_sqlite_file;
+    sqlite3* m_sqlite_db;
+    global_samples_struct* m_globally_sorted_sample_info;
+    global_samples_struct** m_current_position_samples_array;
+    int64_t m_num_current_position_samples;
+  }tiledb_struct;
+
+  typedef struct
+  {
+    FILE* m_spit_random_positions;	//0 in calloc
+    int64_t m_num_random_positions;
+    int64_t m_num_lines_in_vcf;
+    int64_t m_sampling_limit;
+  }random_sampling_struct;
+
+#define SHOULD_DO_SAMPLING(X) ((X).m_spit_random_positions)
+
+  typedef struct
+  {
+    uint8_t m_do_profiling;
+    uint64_t m_num_valid_positions;
+    uint64_t m_sum_sq_valid_interval_length;
+    uint64_t m_max_valid_interval_length;
+    uint64_t m_num_valid_intervals;
+    uint64_t m_max_position;
+    uint64_t m_num_invalid_positions;
+    uint64_t m_sum_sq_invalid_interval_length;
+    uint64_t m_max_invalid_interval_length;
+    uint64_t m_num_invalid_intervals;
+    uint64_t m_last_valid_interval_end;
+  }gvcf_stat_struct;
+
+#define SHOULD_DO_PROFILING(X) ((X).m_do_profiling)
+
+  //Big bag of output control items
+  typedef struct
+  {
+    uint8_t m_skip_coordinates;
+    buffer_wrapper m_csv_out_buffer;
+    FILE* m_csv_out_fptr; //non-0 if output to file/stream
+    gvcf_stat_struct m_profile_intervals; //non-0 if profiling info to be collected
+    random_sampling_struct m_sampling_info;//non-0 if sampling needs to be done
+    char* m_htslib_buffer;
+    unsigned m_htslib_buffer_size; 
+  } csv_output_struct;
+
+  void open_sqlite3_db(const char* sqlite_file, sqlite3** db);
+  void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_info, const bcf_hdr_t* hdr);
+  void initialize_csv_output_info(csv_output_struct* ptr, FILE* output_fptr, unsigned buffer_size, uint8_t reset);
+  void free_sqlite3_data(sqlite_mappings_struct* mapping_info);
+  void free_csv_output_info(csv_output_struct* info);
+  //Write CSV line for a single sample (input_sample_idx)
+  int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_output_info,
+      bcf_hdr_t* out_hdr, bcf1_t* line, int input_sample_idx);
+  //Write CSV lines for all samples in a given line in the VCF
+  void write_csv_for_one_VCF_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_output_info,
+      bcf_hdr_t* out_hdr, bcf1_t* line);
+  
+#ifdef __cplusplus
+}
+#endif
 #endif

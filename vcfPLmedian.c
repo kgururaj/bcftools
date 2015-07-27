@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <assert.h>
 #include <math.h>
+#include "bcftools.h"
 
 #ifdef DEBUG
 #define ASSERT(X)  assert(X)
@@ -17,6 +18,20 @@ int int_comparator(const void* a, const void* b)
     int x = *((const int*)a);
     int y = *((const int*)b);
     return (x<y);
+}
+
+void destroy_PLmedian(plmedian_struct* info)
+{
+  if(info->m_output_fptr)
+  {
+    if(info->m_buffer_len)
+      free(info->m_buffer);
+    if(info->m_median_result_len)
+      free(info->m_median_result);
+    if(info->m_reorg_buffer_len)
+      free(info->m_reorg_buffer);
+    fclose(info->m_output_fptr);
+  }
 }
 
 int compute_PLmedian(bcf_hdr_t* hdr, bcf1_t* line, int** median_result, int* median_result_len,
@@ -64,7 +79,7 @@ int compute_PLmedian(bcf_hdr_t* hdr, bcf1_t* line, int** median_result, int* med
         if(num_valid > 0)
         {
             qsort(*reorg_buffer, num_valid, sizeof(int), int_comparator); 
-            (*median_result)[i] = (*reorg_buffer)[nsamples/2];
+            (*median_result)[i] = (*reorg_buffer)[num_valid/2];
         }
         else
             (*median_result)[i] = bcf_int32_missing;
@@ -74,7 +89,7 @@ int compute_PLmedian(bcf_hdr_t* hdr, bcf1_t* line, int** median_result, int* med
 
 void print_PLmedian(FILE* fptr, bcf_hdr_t* hdr, bcf1_t* line, int* median_result, int median_result_len)
 {
-    fprintf(fptr,"%s\t%d\t%s\t",bcf_seqname(hdr, line), line->pos+1, line->d.allele[0]);
+    fprintf(fptr,"%s,%d,%s,",bcf_seqname(hdr, line), line->pos+1, line->d.allele[0]);
     int i = 0;
     for(i=1;i<line->n_allele;++i)
     {
@@ -82,7 +97,7 @@ void print_PLmedian(FILE* fptr, bcf_hdr_t* hdr, bcf1_t* line, int* median_result
             fprintf(fptr,",");
         fprintf(fptr, "%s", line->d.allele[i]);
     }
-    fprintf(fptr, "\t");
+    fprintf(fptr, ",");
     for(i=0;i<median_result_len;++i)
     {
         if(i>0)
@@ -98,7 +113,7 @@ void print_PLmedian(FILE* fptr, bcf_hdr_t* hdr, bcf1_t* line, int* median_result
 
 int main_PLmedian(int argc, char *argv[])
 {
-    assert(argc == 2 && "Requires at least 1 arguments <vcf1.gz>");
+    assert(argc >= 2 && "Requires at least 1 arguments <vcf1.gz>");
     //open file and read record
     htsFile* fptr = hts_open(argv[1], "r");
     assert(fptr);
@@ -114,7 +129,11 @@ int main_PLmedian(int argc, char *argv[])
     int buffer_len = 0;
     int* reorg_buffer = 0;
     int reorg_buffer_len = 0;
-    FILE* wfptr = fopen("medians.txt","w");
+    FILE* wfptr;
+    if(argc >= 3)
+      wfptr = fopen(argv[2],"w");
+    else
+      wfptr = stdout;
     int veclen = 0;
     while(1)
     {
@@ -126,7 +145,8 @@ int main_PLmedian(int argc, char *argv[])
                 &reorg_buffer, &reorg_buffer_len);
         print_PLmedian(wfptr, hdr, line, median_result, veclen);
     }
-    fclose(wfptr);
+    if(argc >= 3)
+      fclose(wfptr);
     bcf_destroy(line);
     bcf_hdr_destroy(hdr);
     hts_close(fptr);

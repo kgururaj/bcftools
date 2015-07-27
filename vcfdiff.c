@@ -17,6 +17,8 @@
 int g_printed_already = 0;
 extern kstring_t g_debug_string;
 int g_num_files = 0;
+int g_skip_DP_info = 0;
+int g_skip_AD_fmt = 0;
 typedef struct
 {
     char* m_name;
@@ -37,6 +39,7 @@ typedef struct
     int m_gt_map_size;
     int m_GT_fmt_id;
     int m_AD_fmt_id;
+    int m_DP_info_id;
 }reader_map;
 
 reader_map* g_readers_map;
@@ -366,6 +369,8 @@ void compare_info(reader* first_file, reader* second_file, int first_idx, int se
             bcf_info_t* second_info = &(second_line->d.info[j]);
             if(second_info->vptr == 0)
                 continue;
+	    if(g_skip_DP_info && second_info->key == g_readers_map[second_idx].m_DP_info_id)
+		continue;
             second_element_size = get_element_size(bcf_hdr_id2type(second_file->m_hdr, BCF_HL_INFO, second_info->key));
             second_allocated_nvalues = second_allocated_size/second_element_size;
             second_nvalues = bcf_unpack_info_values(second_file->m_hdr, second_line, second_info,
@@ -464,11 +469,10 @@ void compare_fmt(reader* first_file, reader* second_file, int first_idx, int sec
         for(j=0;j<second_line->n_fmt;++j)
         {
             bcf_fmt_t* second_fmt = &(second_line->d.fmt[j]);
-            //FIXME: ignore GT and AD
+            //FIXME: ignore GT 
             //GT because gatk CombineGVCFS simply outputs no genotypes
-            //AD because gatk CombineGVCFS is probably incorrect
             if(second_fmt->p == 0 || second_fmt->id == g_readers_map[second_idx].m_GT_fmt_id
-                    || second_fmt->id == g_readers_map[second_idx].m_AD_fmt_id )
+		|| (g_skip_AD_fmt && second_fmt->id == g_readers_map[second_idx].m_AD_fmt_id) )
                 continue;
             second_element_size = get_element_size(bcf_hdr_id2type(second_file->m_hdr, BCF_HL_FMT, second_fmt->id));
             second_allocated_nvalues = second_allocated_size/second_element_size;
@@ -572,13 +576,40 @@ void compare_filters(reader* first_file, reader* second_file, int first_idx, int
     }
 }
 
+enum ArgsIdxEnum
+{
+  ARGS_IDX_SKIP_DP_INFO=1000,
+  ARGS_IDX_SKIP_AD_FMT
+};
 
 int main_vcfdiff(int argc, char *argv[])
 {
-    assert(argc >= 3 && "Requires at least 2 arguments <vcf1.gz> <vcf2.gz>");
-    g_num_files = argc - 1;
+    int c ;
+    static struct option loptions[] =
+    {
+        {"skip-DP-info",0,0,ARGS_IDX_SKIP_DP_INFO},
+        {"skip-AD-fmt",0,0,ARGS_IDX_SKIP_AD_FMT},
+        {0,0,0,0}
+    };
+    while ((c = getopt_long(argc, argv, "",loptions,NULL)) >= 0) {
+	switch(c)
+	{
+	    case ARGS_IDX_SKIP_DP_INFO:
+		g_skip_DP_info = 1;
+		break;
+	    case ARGS_IDX_SKIP_AD_FMT:
+		g_skip_AD_fmt = 1;
+		break;
+	    default:
+		fprintf(stderr,"Unknown option\n");
+		exit(-1);
+	}
+    }
+    assert(argc - optind >= 2 && "Requires at least 2 arguments <vcf1.gz> <vcf2.gz>");
+    argv = argv + optind;
+    g_num_files = argc - optind;
     g_files = (reader*)malloc(g_num_files*sizeof(reader));
-    g_readers_map = (reader_map*)malloc(g_num_files*sizeof(reader_map));
+    g_readers_map = (reader_map*)calloc(g_num_files, sizeof(reader_map));
     //debug string
     ks_resize(&g_debug_string, 4096);   //4KB
     //open file and read record
@@ -587,8 +618,8 @@ int main_vcfdiff(int argc, char *argv[])
     for(i=0;i<g_num_files;++i)
     {
         reader* curr_file = &(g_files[i]);
-        curr_file->m_fptr = hts_open(argv[1+i], "r");
-        curr_file->m_name = argv[1+i];
+        curr_file->m_fptr = hts_open(argv[i], "r");
+        curr_file->m_name = argv[i];
         assert(curr_file->m_fptr);
         curr_file->m_hdr = bcf_hdr_read(curr_file->m_fptr);
         curr_file->m_line = bcf_init();
@@ -621,6 +652,9 @@ int main_vcfdiff(int argc, char *argv[])
         //AD id
         g_readers_map[i].m_AD_fmt_id = bcf_hdr_id2int(curr_file->m_hdr, BCF_DT_ID, "AD");
         ASSERT(g_readers_map[i].m_AD_fmt_id);
+	//DP id
+        g_readers_map[i].m_DP_info_id = bcf_hdr_id2int(curr_file->m_hdr, BCF_DT_ID, "DP");
+        ASSERT(g_readers_map[i].m_DP_info_id);
         //set length type of AD to R
         int AD_id = bcf_hdr_id2int(curr_file->m_hdr, BCF_DT_ID, "AD");
         if(AD_id >= 0)

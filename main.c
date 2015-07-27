@@ -184,11 +184,6 @@ static cmd_t cmds[] =
     }
 };
 
-char *bcftools_version(void)
-{
-    return BCFTOOLS_VERSION;
-}
-
 static void usage(FILE *fp)
 {
     fprintf(fp, "\n");
