@@ -33,6 +33,7 @@ struct _vcmp_t
     char *dref;
     int ndref, mdref;   // ndref: positive when ref1 longer, negative when ref2 is longer
     int nmatch;
+    int *map, mmap;
 };
 
 vcmp_t *vcmp_init()
@@ -42,6 +43,7 @@ vcmp_t *vcmp_init()
 
 void vcmp_destroy(vcmp_t *vcmp)
 {
+    free(vcmp->map);
     free(vcmp->dref);
     free(vcmp);
 }
@@ -51,17 +53,18 @@ int vcmp_set_ref(vcmp_t *vcmp, char *ref1, char *ref2)
     vcmp->ndref = 0;
 
     char *a = ref1, *b = ref2;
-    while ( *a && *b && *a==*b ) { a++; b++; }
+    while ( *a && *b && toupper(*a)==toupper(*b) ) { a++; b++; }
     if ( !*a && !*b ) return 0;
     if ( *a && *b ) return -1;  // refs not compatible
 
+    int i;
     if ( *a )   // ref1 is longer
     {
         vcmp->nmatch = b-ref2;
         while ( *a ) a++;
         vcmp->ndref = (a-ref1) - vcmp->nmatch;
         hts_expand(char,vcmp->ndref+1,vcmp->mdref,vcmp->dref);
-        memcpy(vcmp->dref,ref1+vcmp->nmatch,vcmp->ndref);
+        for (i=0; i<vcmp->ndref; i++) vcmp->dref[i] = toupper(ref1[vcmp->nmatch+i]);
         vcmp->dref[vcmp->ndref] = 0;
         return 0;
     }
@@ -71,7 +74,7 @@ int vcmp_set_ref(vcmp_t *vcmp, char *ref1, char *ref2)
     while ( *b ) b++;
     vcmp->ndref = (b-ref2) - vcmp->nmatch;
     hts_expand(char,vcmp->ndref+1,vcmp->mdref,vcmp->dref);
-    memcpy(vcmp->dref,ref2+vcmp->nmatch,vcmp->ndref);
+    for (i=0; i<vcmp->ndref; i++) vcmp->dref[i] = toupper(ref2[vcmp->nmatch+i]);
     vcmp->dref[vcmp->ndref] = 0;
     vcmp->ndref *= -1;
     return 0;
@@ -83,7 +86,7 @@ int vcmp_find_allele(vcmp_t *vcmp, char **als1, int nals1, char *al2)
     for (i=0; i<nals1; i++)
     {
         char *a = als1[i], *b = al2;
-        while ( *a && *b && *a==*b ) { a++; b++; }
+        while ( *a && *b && toupper(*a)==toupper(*b) ) { a++; b++; }
         if ( *a && *b ) continue;   // mismatch
         if ( !vcmp->ndref )
         {
@@ -96,14 +99,14 @@ int vcmp_find_allele(vcmp_t *vcmp, char **als1, int nals1, char *al2)
         {
             if ( vcmp->ndref<0 ) continue;
             for (j=0; j<vcmp->ndref; j++)
-                if ( !a[j] || a[j]!=vcmp->dref[j] ) break;
+                if ( !a[j] || toupper(a[j])!=vcmp->dref[j] ) break;
             if ( j!=vcmp->ndref || a[j] ) continue;
             break;  // found
         }
 
         if ( vcmp->ndref>0 ) continue;
         for (j=0; j<-vcmp->ndref; j++)
-            if ( !b[j] || b[j]!=vcmp->dref[j] ) break;
+            if ( !b[j] || toupper(b[j])!=vcmp->dref[j] ) break;
         if ( j!=-vcmp->ndref || b[j] ) continue;
         break;  // found
     }
@@ -111,4 +114,18 @@ int vcmp_find_allele(vcmp_t *vcmp, char **als1, int nals1, char *al2)
     return i;
 }
 
+
+int *vcmp_map_ARvalues(vcmp_t *vcmp, int n, int nals1, char **als1, int nals2, char **als2)
+{
+    if ( vcmp_set_ref(vcmp,als1[0],als2[0]) < 0 ) return NULL;
+
+    vcmp->map = (int*) realloc(vcmp->map,sizeof(int)*n);
+
+    int i, ifrom = n==nals2 ? 0 : 1;
+    for (i=ifrom; i<nals2; i++)
+    {
+        vcmp->map[i-ifrom] = vcmp_find_allele(vcmp, als1+ifrom, nals1-ifrom, als2[i]);
+    }
+    return vcmp->map;
+}
 

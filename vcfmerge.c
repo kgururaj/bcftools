@@ -958,7 +958,7 @@ char **merge_alleles(char **a, int na, int *map, char **b, int *nb, int *mb, var
         }
 
         for (j=1; j<*nb; j++)
-            if ( !strcmp(ai,b[j]) ) break;
+            if ( !strcasecmp(ai,b[j]) ) break;
 
         if ( j<*nb ) // $b already has the same allele
         {
@@ -1231,6 +1231,14 @@ static void bcf_info_set_id(bcf1_t *line, bcf_info_t *info, int id, kstring_t *t
     tmp_str->l = 0;
 }
 
+/*
+ *  copy_string_field() - copy a comma-separated field
+ *  @param src:     source string
+ *  @param isrc:    index of the field to copy 
+ *  @param src_len: length of source string (excluding the terminating \0) 
+ *  @param dst:     destination kstring (must be initialized)
+ *  @param idst:    index of the destination field
+ */
 int copy_string_field(char *src, int isrc, int src_len, kstring_t *dst, int idst)
 {
     int ith_src = 0, start_src = 0;    // i-th field in src string
@@ -3068,11 +3076,10 @@ void merge_buffer(args_t *args)
                     pos = line->pos;
                     continue;
                 }
-
                 // normalize alleles
                 maux->als = merge_alleles(line->d.allele, line->n_allele, maux->d[i][j].map, maux->als, &maux->nals, &maux->mals,
                         line->d.var, &contains_non_ref, line->m_is_split_record);
-                if ( !maux->als ) error("Failed to merge alleles at %s:%d\n",bcf_seqname(args->out_hdr,line),line->pos+1);
+                if ( !maux->als ) error("Failed to merge alleles at %s:%d in %s\n",bcf_seqname(args->out_hdr,line),line->pos+1,reader->fname);
                 hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
                 for (k=1; k<line->n_allele; k++)
                 {
@@ -3888,7 +3895,8 @@ static void usage(void)
 {
     fprintf(stderr, "\n");
     fprintf(stderr, "About:   Merge multiple VCF/BCF files from non-overlapping sample sets to create one multi-sample file.\n");
-    fprintf(stderr, "         Compatible records are combined into one according to the -m option.\n");
+    fprintf(stderr, "         Note that only records from different files can be merged, never from the same file. For\n");
+    fprintf(stderr, "         \"vertical\" merge take a look at \"bcftools norm\" instead.\n");
     fprintf(stderr, "Usage:   bcftools merge [options] <A.vcf.gz> <B.vcf.gz> [...]\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Options:\n");
@@ -3898,7 +3906,7 @@ static void usage(void)
     fprintf(stderr, "    -f, --apply-filters <list>         require at least one of the listed FILTER strings (e.g. \"PASS,.\")\n");
     fprintf(stderr, "    -i, --info-rules <tag:method,..>   rules for merging INFO fields (method is one of sum,avg,min,max,join) or \"-\" to turn off the default [DP:sum,DP4:sum]\n");
     fprintf(stderr, "    -l, --file-list <file>             read file names from the file\n");
-    fprintf(stderr, "    -m, --merge <string>               merge sites with differing alleles for <snps|indels|both|all|none|id>, see man page for details [both]\n");
+    fprintf(stderr, "    -m, --merge <string>               allow multiallelic records for <snps|indels|both|all|none|id>, see man page for details [both]\n");
     fprintf(stderr, "    -o, --output <file>                write output to a file [standard output]\n");
     fprintf(stderr, "    -O, --output-type <b|u|z|v>        'b' compressed BCF; 'u' uncompressed BCF; 'z' compressed VCF; 'v' uncompressed VCF [v]\n");
     fprintf(stderr, "    -r, --regions <region>             restrict to comma-separated list of regions\n");

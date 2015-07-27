@@ -1,6 +1,6 @@
 /*  main.c -- main bcftools command front-end.
 
-    Copyright (C) 2012-2014 Genome Research Ltd.
+    Copyright (C) 2012-2015 Genome Research Ltd.
 
     Author: Petr Danecek <pd3@sanger.ac.uk>
 
@@ -161,7 +161,7 @@ static cmd_t cmds[] =
 #if USE_GPL
     { .func  = main_polysomy,
       .alias = "polysomy",
-      .help  = "-detect number of chromosomal copies",
+      .help  = "detect number of chromosomal copies",
     },
 #endif
     { .func  = main_vcfroh,
@@ -193,7 +193,7 @@ static void usage(FILE *fp)
 #endif
     fprintf(fp, "Version: %s (using htslib %s)\n", bcftools_version(), hts_version());
     fprintf(fp, "\n");
-    fprintf(fp, "Usage:   bcftools <command> <argument>\n");
+    fprintf(fp, "Usage:   bcftools [--version|--version-only] [--help] <command> <argument>\n");
     fprintf(fp, "\n");
     fprintf(fp, "Commands:\n");
 
@@ -224,7 +224,7 @@ int main(int argc, char *argv[])
     if (argc < 2) { usage(stderr); return 1; }
 
     if (strcmp(argv[1], "version") == 0 || strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0) {
-        printf("bcftools %s\nUsing htslib %s\nCopyright (C) 2014 Genome Research Ltd.\n", bcftools_version(), hts_version());
+        printf("bcftools %s\nUsing htslib %s\nCopyright (C) 2015 Genome Research Ltd.\n", bcftools_version(), hts_version());
 #if USE_GPL
         printf("License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n");
 #else

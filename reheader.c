@@ -30,6 +30,7 @@ THE SOFTWARE.  */
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fcntl.h>
 #include <math.h>
 #include <htslib/vcf.h>
 #include <htslib/bgzf.h>
@@ -39,22 +40,12 @@ THE SOFTWARE.  */
 
 typedef struct _args_t
 {
-    char **argv, *fname, *samples_fname, *header_fname;
+    char **argv, *fname, *samples_fname, *header_fname, *output_fname;
+    htsFile *fp;
     htsFormat type;
     int argc;
 }
 args_t;
-
-static void init_data(args_t *args)
-{
-    htsFile *fp = hts_open(args->fname,"r");
-    args->type = *hts_get_format(fp);
-    hts_close(fp);
-}
-
-static void destroy_data(args_t *args)
-{
-}
 
 static void read_header_file(char *fname, kstring_t *hdr)
 {
@@ -170,9 +161,10 @@ static void set_samples(char **samples, int nsamples, kstring_t *hdr)
     kputc('\n', hdr);
 }
 
+BGZF *hts_get_bgzfp(htsFile *fp);
 static void reheader_vcf_gz(args_t *args)
 {
-    BGZF *fp = bgzf_open(args->fname,"r");
+    BGZF *fp = hts_get_bgzfp(args->fp);
     if ( !fp || bgzf_read_block(fp) != 0 || !fp->block_length )
         error("Failed to read %s: %s\n", args->fname, strerror(errno));
 
@@ -228,7 +220,11 @@ static void reheader_vcf_gz(args_t *args)
     }
 
     // Output the modified header
-    BGZF *bgzf_out = bgzf_dopen(fileno(stdout), "w");
+    BGZF *bgzf_out;
+    if ( args->output_fname )
+        bgzf_out = bgzf_open(args->output_fname,"w");
+    else
+        bgzf_out = bgzf_dopen(fileno(stdout), "w");
     bgzf_write(bgzf_out, hdr.s, hdr.l);
     free(hdr.s);
 
@@ -258,7 +254,7 @@ static void reheader_vcf_gz(args_t *args)
 static void reheader_vcf(args_t *args)
 {
     kstring_t hdr = {0,0,0};
-    htsFile *fp = hts_open(args->fname, "r"); if ( !fp ) error("Failed to open: %s\n", args->fname);
+    htsFile *fp = args->fp;
     while ( hts_getline(fp, KS_SEP_LINE, &fp->line) >=0 )
     {
         kputc('\n',&fp->line);  // hts_getline eats the newline character
@@ -283,7 +279,8 @@ static void reheader_vcf(args_t *args)
         free(samples);
     }
 
-    int out = STDOUT_FILENO;
+    int out = args->output_fname ? open(args->output_fname, O_WRONLY|O_CREAT|O_TRUNC, 0666) : STDOUT_FILENO;
+    if ( out==-1 ) error("%s: %s\n", args->output_fname,strerror(errno));
     if ( write(out, hdr.s, hdr.l)!=hdr.l ) error("Failed to write %d bytes\n", hdr.l);
     free(hdr.s);
     if ( fp->line.l )
@@ -296,6 +293,7 @@ static void reheader_vcf(args_t *args)
         if ( write(out, fp->line.s, fp->line.l)!=fp->line.l ) error("Failed to write %d bytes\n", fp->line.l);
     }
     hts_close(fp);
+    close(out);
 }
 
 static bcf_hdr_t *strip_header(bcf_hdr_t *src, bcf_hdr_t *dst)
@@ -352,7 +350,7 @@ static bcf_hdr_t *strip_header(bcf_hdr_t *src, bcf_hdr_t *dst)
 
 static void reheader_bcf(args_t *args, int is_compressed)
 {
-    htsFile *fp = hts_open(args->fname, "r"); if ( !fp ) error("Failed to open: %s\n", args->fname);
+    htsFile *fp = args->fp;
     bcf_hdr_t *hdr = bcf_hdr_read(fp); if ( !hdr ) error("Failed to read the header: %s\n", args->fname);
     kstring_t htxt = {0,0,0};
     int hlen;
@@ -376,11 +374,12 @@ static void reheader_bcf(args_t *args, int is_compressed)
     }
 
     bcf_hdr_t *hdr_out = bcf_hdr_init("r");
-    bcf_hdr_parse(hdr_out, htxt.s);
+    if ( bcf_hdr_parse(hdr_out, htxt.s) < 0 ) error("An error occurred while parsing the header\n");
     if ( args->header_fname ) hdr_out = strip_header(hdr, hdr_out);
 
     // write the header and the body
-    htsFile *fp_out = hts_open("-",is_compressed ? "wb" : "wbu");
+    htsFile *fp_out = hts_open(args->output_fname ? args->output_fname : "-",is_compressed ? "wb" : "wbu");
+    if ( !fp_out ) error("%s: %s\n", args->output_fname ? args->output_fname : "-", strerror(errno));
     bcf_hdr_write(fp_out, hdr_out);
 
     bcf1_t *rec = bcf_init();
@@ -446,6 +445,7 @@ static void usage(args_t *args)
     fprintf(stderr, "\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "    -h, --header <file>     new header\n");
+    fprintf(stderr, "    -o, --output <file>     write output to a file [standard output]\n");
     fprintf(stderr, "    -s, --samples <file>    new sample names\n");
     fprintf(stderr, "\n");
     exit(1);
@@ -459,14 +459,16 @@ int main_reheader(int argc, char *argv[])
 
     static struct option loptions[] =
     {
+        {"output",1,0,'o'},
         {"header",1,0,'h'},
         {"samples",1,0,'s'},
         {0,0,0,0}
     };
-    while ((c = getopt_long(argc, argv, "s:h:c",loptions,NULL)) >= 0)
+    while ((c = getopt_long(argc, argv, "s:h:o:",loptions,NULL)) >= 0)
     {
         switch (c)
         {
+            case 'o': args->output_fname = optarg; break;
             case 's': args->samples_fname = optarg; break;
             case 'h': args->header_fname = optarg; break;
             case '?': usage(args);
@@ -484,7 +486,9 @@ int main_reheader(int argc, char *argv[])
     if ( !args->samples_fname && !args->header_fname ) usage(args);
     if ( !args->fname ) usage(args);
 
-    init_data(args);
+    args->fp = hts_open(args->fname,"r");
+    if ( !args->fp ) error("Failed to open: %s\n", args->fname);
+    args->type = *hts_get_format(args->fp);
 
     if ( args->type.format==vcf )
     {
@@ -496,7 +500,6 @@ int main_reheader(int argc, char *argv[])
     else
         reheader_bcf(args, args->type.compression==bgzf || args->type.compression==gzip);
 
-    destroy_data(args);
     free(args);
     return 0;
 }

@@ -27,6 +27,7 @@ THE SOFTWARE.  */
 
 #include <stdarg.h>
 #include <htslib/vcf.h>
+#include <math.h>
 
 #define FT_GZ 1
 #define FT_VCF 2
@@ -111,7 +112,7 @@ extern "C"
 
   typedef struct
   {
-  
+
     int64_t* input_sample_idx_2_global_idx;
     int64_t* input_field_idx_2_global_idx;
     int64_t* input_contig_idx_2_global_idx;
@@ -120,12 +121,12 @@ extern "C"
     sqlite3* db;
   }sqlite_mappings_struct;
 
-  typedef struct
-  {
-    int m_input_sample_idx;
-    int m_reader_idx;
-    int64_t m_global_sample_idx;
-  }global_samples_struct;
+    typedef struct
+    {
+      int m_input_sample_idx;
+      int m_reader_idx;
+      int64_t m_global_sample_idx;
+    }global_samples_struct;
 
   typedef struct
   {
@@ -193,8 +194,16 @@ extern "C"
   //Write CSV lines for all samples in a given line in the VCF
   void write_csv_for_one_VCF_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_output_info,
       bcf_hdr_t* out_hdr, bcf1_t* line);
-  
+
+  static inline double phred_score(double prob)
+  {
+    if ( prob==0 ) return 99;
+    prob = -4.3429*log(prob);
+    return prob>99 ? 99 : prob;
+  }
+
 #ifdef __cplusplus
 }
 #endif
+
 #endif
