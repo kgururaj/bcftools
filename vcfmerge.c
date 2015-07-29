@@ -1173,18 +1173,12 @@ void merge_filter(args_t *args, bcf1_t *out)
             int k;
             for (k=0; k<line->d.n_flt; k++)
             {
-                const char *flt = hdr->id[BCF_DT_ID][line->d.flt[k]].key;
-                kitr = kh_get(strdict, tmph, flt);
-                //if filter not already added, add
-                if ( kitr == kh_end(tmph) )
-                {
-                    int id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, flt);
-                    if ( id==-1 ) error("The filter not defined: %s\n", flt);
-                    hts_expand(int,out->d.n_flt+1,ma->mflt,ma->flt);
-                    ma->flt[out->d.n_flt] = id;
-                    out->d.n_flt++;
-                    kh_put(strdict, tmph, flt, &ret);
-                }
+                int id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, flt);
+                if ( id==-1 ) error("Error: The filter is not defined in the header: %s\n", flt);
+                hts_expand(int,out->d.n_flt+1,ma->mflt,ma->flt);
+                ma->flt[out->d.n_flt] = id;
+                out->d.n_flt++;
+                kh_put(strdict, tmph, flt, &ret);
             }
         }
     // Check if PASS is not mixed with other filters

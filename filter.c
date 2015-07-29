@@ -561,12 +561,39 @@ static void filters_set_genotype_string(filter_t *flt, bcf1_t *line, token_t *to
         return;
     }
     int i, blen = 3, nsmpl = bcf_hdr_nsamples(flt->hdr);
-    kstring_t str; str.s = tok->str_value; str.m = tok->values[0] * nsmpl; str.l = 0;
+    kstring_t str;
+
+gt_length_too_big:
+    str.s = tok->str_value; str.m = tok->values[0] * nsmpl; str.l = 0;
     for (i=0; i<nsmpl; i++)
     {
         int plen = str.l;
-        bcf_format_gt(fmt, i, &str);
-        assert( str.l - plen <= blen ); // increase blen if this fails
+
+        #define BRANCH(type_t) { \
+            type_t *ptr = (type_t*) (fmt->p + i*fmt->size); \
+            if ( !(ptr[0]>>1) ) kputc('.',&str); \
+        }
+        switch (fmt->type) {
+            case BCF_BT_INT8:  BRANCH(int8_t); break;
+            case BCF_BT_INT16: BRANCH(int16_t); break;
+            case BCF_BT_INT32: BRANCH(int32_t); break;
+            default: fprintf(stderr,"FIXME: type %d in bcf_format_gt?\n", fmt->type); abort(); break;
+        }
+        #undef BRANCH
+
+        if ( plen==str.l )
+        {
+            bcf_format_gt(fmt, i, &str);
+            if ( str.l - plen > blen )
+            {
+                // too many alternate alleles or ploidy is too large, the genotype does not fit
+                // three characters ("0/0" vs "10/10").
+                tok->str_value = str.s;
+                blen *= 2;
+                goto gt_length_too_big;
+            }
+        }
+
         plen = str.l - plen;
         while ( plen<blen )
         {
@@ -637,7 +664,12 @@ static void filters_set_ac(filter_t *flt, bcf1_t *line, token_t *tok)
     if ( tok->idx>=0 )
     {
         tok->nvalues = 1;
-        tok->values[0] = flt->tmpi[tok->idx+1];
+        tok->values[0] = tok->idx+1<line->n_allele ? flt->tmpi[tok->idx+1] : 0;
+    }
+    else if ( line->n_allele==1 )   // no ALT
+    {
+        tok->nvalues = 1;
+        tok->values[0] = 0;
     }
     else
     {
