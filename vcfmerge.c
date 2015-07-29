@@ -1154,7 +1154,6 @@ void merge_filter(args_t *args, bcf1_t *out)
     bcf_hdr_t *out_hdr = args->out_hdr;
 
     int i, ret;
-    khiter_t kitr;
     strdict_t *tmph = args->tmph;
     kh_clear(strdict, tmph);
 
@@ -1173,6 +1172,7 @@ void merge_filter(args_t *args, bcf1_t *out)
             int k;
             for (k=0; k<line->d.n_flt; k++)
             {
+                const char *flt = hdr->id[BCF_DT_ID][line->d.flt[k]].key;
                 int id = bcf_hdr_id2int(out_hdr, BCF_DT_ID, flt);
                 if ( id==-1 ) error("Error: The filter is not defined in the header: %s\n", flt);
                 hts_expand(int,out->d.n_flt+1,ma->mflt,ma->flt);
@@ -1714,7 +1714,9 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
     const char *key = NULL;
     int nsize = 0, length = BCF_VL_FIXED, type = -1;
 
+#if defined(USE_ID_MAP) && defined(DEBUG)
     int out_id = -1;
+#endif
     for (i=0; i<files->nreaders; i++)
     {
         if ( !ma->has_line[i] ) continue;
@@ -1722,8 +1724,9 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
         if ( !key ) key = files->readers[i].processed_header->id[BCF_DT_ID][fmt_map[i]->id].key;
         type = fmt_map[i]->type;
         int length_descriptor = bcf_hdr_id2length(files->readers[i].processed_header, BCF_HL_FMT, fmt_map[i]->id);
-#ifdef USE_ID_MAP
+#if defined(USE_ID_MAP) && defined(DEBUG)
         out_id = args->m_idmap.m_readers_map[i].m_id_2_merged_id[fmt_map[i]->id];
+        ASSERT(out_id >= 0);
 #endif
         if ( IS_VL_G(files->readers[i].processed_header, fmt_map[i]->id) )
         { 
@@ -1897,7 +1900,7 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                     src = (src_type_t*) (fmt_ori->p + j*fmt_ori->size); \
                     if(line->m_non_ref_idx >= 0)  /*NON_REF allele*/ \
                     { \
-                        int src_length =  (length == BCF_VL_R) ? line->n_allele : line->n_allele-1; \
+                        int src_length =  ((length == BCF_VL_R) ? line->n_allele : line->n_allele-1); \
                         initialize_ARG_vectors_for_NON_REF(line, length, als, (out->n_allele), src, src_length, tgt, tgt_type_t); \
                     } \
                     else \
@@ -1916,6 +1919,8 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
             } \
             ismpl += bcf_hdr_nsamples(hdr); \
         }
+        //Disable signed overflow warnings for this code segment - I know what I am doing (mwahaha)
+#pragma GCC diagnostic ignored "-Wstrict-overflow"
         switch (type)
         {
             case BCF_BT_INT8:  BRANCH(int32_t,  int8_t, *src==bcf_int8_missing,  *src==bcf_int8_vector_end,  *tgt=bcf_int32_missing, *tgt=bcf_int32_vector_end); break;
@@ -1925,6 +1930,7 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
             case BCF_BT_CHAR:  BRANCH(uint8_t, uint8_t, *src==bcf_str_missing, *src==bcf_str_vector_end, *tgt=bcf_str_missing, *tgt=bcf_str_vector_end); break;
             default: error("Unexpected case: %d, %s\n", type, key);
         }
+#pragma GCC diagnostic warning "-Wstrict-overflow"
         #undef BRANCH
     }
     if ( type==BCF_BT_FLOAT )
@@ -2460,6 +2466,9 @@ void preprocess_line(args_t* args, bcf_sr_t* reader, bcf1_t* line, int file_idx)
     int* id2action = g_merge_config.file2id2action[file_idx];
     //Number of samples in file
     int nsamples = bcf_hdr_nsamples(src_hdr);
+#ifdef DEBUG
+    int delete_info = -1;
+#endif 
     //Deal with FORMAT fields first as INFO fields may be moved/copied to FORMAT later
     for(i=0;i<line->n_fmt;++i)
     {
@@ -2467,14 +2476,16 @@ void preprocess_line(args_t* args, bcf_sr_t* reader, bcf1_t* line, int file_idx)
         int dict_id = curr_fmt->id;
         int type = bcf_hdr_id2type(src_hdr, BCF_HL_FMT, dict_id);
         //Can't declare within switch
-        int delete_info = 0;
         switch(id2action[dict_id])
         {
             case MERGE_KEEP:
                 break;
             case MERGE_DROP:
                 //remove INFO field
-                delete_info = bcf_update_format_struct(src_hdr, line, 0, 0, 0, type, curr_fmt, dict_id);
+#ifdef DEBUG
+                delete_info =
+#endif
+                    bcf_update_format_struct(src_hdr, line, 0, 0, 0, type, curr_fmt, dict_id);
                 ASSERT(delete_info >= 0);
                 break;
             default:
@@ -2494,7 +2505,6 @@ void preprocess_line(args_t* args, bcf_sr_t* reader, bcf1_t* line, int file_idx)
         int new_dict_id = -1;
         int idx = 0;
         int bytes_per_sample = 0;
-        int delete_info = 0;
         const char* processed_info_string = 0;
         switch(id2action[dict_id])
         {
@@ -2502,7 +2512,10 @@ void preprocess_line(args_t* args, bcf_sr_t* reader, bcf1_t* line, int file_idx)
                 break;
             case MERGE_DROP:
                 //remove INFO field
-                delete_info = bcf_update_info_struct(src_hdr, line, 0, 0, 0, type, curr_info, dict_id);
+#ifdef DEBUG
+                delete_info =
+#endif
+                    bcf_update_info_struct(src_hdr, line, 0, 0, 0, type, curr_info, dict_id);
                 ASSERT(delete_info >= 0);
                 break;
             case MERGE_COPY_TO_FORMAT:
@@ -2542,7 +2555,10 @@ void preprocess_line(args_t* args, bcf_sr_t* reader, bcf1_t* line, int file_idx)
                     if(id2action[dict_id] == MERGE_MOVE_TO_FORMAT)
                     {
                         //remove INFO field
-                        delete_info = bcf_update_info_struct(src_hdr, line, 0, 0, 0, type, curr_info, dict_id);
+#ifdef DEBUG
+                        delete_info =
+#endif
+                            bcf_update_info_struct(src_hdr, line, 0, 0, 0, type, curr_info, dict_id);
                         ASSERT(delete_info >= 0);
                     }
                     //format fields have no flag type

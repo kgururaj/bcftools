@@ -351,7 +351,6 @@ void compare_info(reader* first_file, reader* second_file, int first_idx, int se
             printf("Different number of INFO fields\n");
             return;
         }
-        int diff_info = 0;
         
         char* first_values = 0;
         int first_allocated_nvalues = 0;
@@ -405,7 +404,6 @@ void compare_info(reader* first_file, reader* second_file, int first_idx, int se
                 }
             if(found_info <= 0)
             {
-                diff_info = 1;
                 print_lines(first_file, second_file, first_idx, second_idx);
                 printf("Different INFO field %s\n",bcf_hdr_int2id(second_file->m_hdr, BCF_DT_ID, second_info->key));
             }
@@ -447,7 +445,6 @@ void compare_fmt(reader* first_file, reader* second_file, int first_idx, int sec
             printf("Different number of FORMAT fields\n");
             return;
         }
-        int diff_fmt = 0;
         
         char* first_values = 0;
         int first_allocated_nvalues = 0;
@@ -525,7 +522,6 @@ void compare_fmt(reader* first_file, reader* second_file, int first_idx, int sec
                 g_diff_string = " invalid map to golden ";
             if(found_fmt <= 0)
             {
-                diff_fmt = 1;
                 print_lines(first_file, second_file, first_idx, second_idx);
                 printf("Different FORMAT field %s diff string : %s\n",bcf_hdr_int2id(second_file->m_hdr, BCF_DT_ID, second_fmt->id), g_diff_string);
             }
