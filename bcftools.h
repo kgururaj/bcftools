@@ -93,26 +93,28 @@ extern "C"
     unsigned m_offset;
     unsigned m_size;
     char* m_buffer;
-    uint64_t m_global_sample_idx;
-    uint64_t m_global_start_position;
-    uint64_t m_global_end_position;
+    int64_t m_global_sample_idx;
+    int64_t m_global_start_position;
+    int64_t m_global_end_position;
   } buffer_wrapper;
 
-#define TILEDB_CSV_BPRINTF(buffer, ...) \
-  { \
-    int buffer_space_available = buffer->m_size - buffer->m_offset; \
-    int num_chars_printed = snprintf(buffer->m_buffer+buffer->m_offset, buffer_space_available, __VA_ARGS__); \
-    if(num_chars_printed >= buffer_space_available) \
-    { \
-      fprintf(stderr, "TileDB CSV line too long - exiting :(\n"); \
-      exit(-1); \
-    } \
-    buffer->m_offset += num_chars_printed; \
-  }
+#define ALLOCATE_SPACE_IN_BUFFER(buffer, bytes) \
+  buffer->m_offset += bytes; \
+  if(buffer->m_offset >= buffer->m_size) \
+      error("TileDB CSV output buffer has overflown :(\n");
 
+  enum TileDBOutputVersion
+  {
+    TILEDB_OUTPUT_CSV_V0=0,
+    TILEDB_OUTPUT_CSV_V1,
+    TILEDB_OUTPUT_BINARY_V1,
+  };
+  typedef void (*TileDBPrinterTy) (buffer_wrapper* buffer, unsigned bcf_ht_type, const char* fmt, ...);
   typedef struct
   {
-
+    unsigned m_tiledb_output_version;
+    //Pointer to printer function
+    TileDBPrinterTy m_tiledb_printer;
     int64_t* input_sample_idx_2_global_idx;
     int64_t* input_field_idx_2_global_idx;
     int64_t* input_contig_idx_2_global_idx;
@@ -202,6 +204,7 @@ extern "C"
     return prob>99 ? 99 : prob;
   }
 
+  unsigned string_to_tiledb_output_version(const char* string);
 #ifdef __cplusplus
 }
 #endif

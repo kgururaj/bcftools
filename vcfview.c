@@ -39,6 +39,7 @@ THE SOFTWARE.  */
 #include "htslib/khash_str2int.h"
 #include <inttypes.h>
 #include <time.h>
+#include <float.h>
 
 #ifdef DEBUG
 #define ASSERT(x)  assert(x)
@@ -644,6 +645,99 @@ int max_contig_offset_sqlite_handler(void* ptr, int num_columns, char** field_va
 
 #define ZERO_BASED_POSITION 1
 #define ZERO_BASED_SAMPLE_IDS 1
+unsigned char g_CSV_MISSING_CHARACTER='#';
+#define CSV_NON_REF_REPRESENTATION "&"
+
+unsigned string_to_tiledb_output_version(const char* string)
+{
+    if(strcmp(string, "v0") == 0)
+        return TILEDB_OUTPUT_CSV_V0;
+    else
+        if(strcmp(string, "csv_v1") == 0)
+            return  TILEDB_OUTPUT_CSV_V1;
+        else
+            if(strcmp(string, "bin_v1") == 0)
+                return TILEDB_OUTPUT_BINARY_V1;
+            else
+                error("Unknown TileDB output format: '%s'\n",string);
+    exit(-1);
+    return 0;
+}
+
+void tiledb_csv_printer(buffer_wrapper* buffer, unsigned bcf_ht_type, const char* fmt_string, ...)
+{
+    va_list ap;
+    va_start(ap, fmt_string);
+    int buffer_space_available = buffer->m_size - buffer->m_offset;
+    //If fmt_string is NULL, print the MISSING value
+    int num_chars_printed = fmt_string ? vsnprintf(buffer->m_buffer+buffer->m_offset, buffer_space_available, fmt_string, ap)
+        : snprintf(buffer->m_buffer+buffer->m_offset, buffer_space_available, ",%c", g_CSV_MISSING_CHARACTER);
+    if(num_chars_printed >= buffer_space_available) 
+    { 
+        fprintf(stderr, "TileDB CSV line too long - exiting :(\n"); 
+        exit(-1); 
+    } 
+    buffer->m_offset += num_chars_printed; 
+    va_end(ap);
+}
+
+void tiledb_binary_printer(buffer_wrapper* buffer, unsigned bcf_ht_type, const char* fmt_string, ...)
+{
+    va_list ap;
+    va_start(ap, fmt_string);
+    //Temporary variables for use in switch statement
+    int int_val;
+    float float_val;
+    char char_val;
+    int64_t int64_val;
+    //To be used in memcpy
+    size_t bytes = 0;
+    char* ptr;
+    char missing_string[] = { g_CSV_MISSING_CHARACTER, '\0' };
+    //For proper printing
+    //If fmt_string is NULL, print missing value
+#define TILEDB_BIN_SET_PTR(va_type_t, type_t, val, missing_value)\
+    val = fmt_string ? (type_t)(va_arg(ap, va_type_t)) : missing_value; \
+    ptr = (char*)(&(val)); \
+    bytes = sizeof(type_t);
+    switch(bcf_ht_type)
+    {
+        case BCF_HT_INT:
+            TILEDB_BIN_SET_PTR(int, int, int_val, INT_MAX);
+            break;
+        case BCF_HT_REAL:
+            TILEDB_BIN_SET_PTR(double, float, float_val, FLT_MAX);
+            break;
+        case BCF_HT_STR:
+            ptr = fmt_string ? va_arg(ap, char*) : missing_string;
+            bytes = strlen(ptr);
+            break;
+        case BCF_HT_CHAR:
+            TILEDB_BIN_SET_PTR(int, char, char_val, g_CSV_MISSING_CHARACTER);
+            break;
+        case BCF_HT_INT64:
+            TILEDB_BIN_SET_PTR(int64_t, int64_t, int64_val, LLONG_MAX);
+            break;
+        case BCF_HT_VOID:
+            bytes = 0;
+            break;
+        default:
+            fprintf(stderr, "Unknown BCF HT type %d, exiting\n", bcf_ht_type);
+            exit(-1);
+    }
+    va_end(ap);
+    if(bytes == 0)
+        return;
+    int buffer_space_available = buffer->m_size - buffer->m_offset;
+    if(bytes > buffer_space_available) 
+    { 
+        fprintf(stderr, "TileDB binary line too long - exiting :(\n"); 
+        exit(-1); 
+    }
+    memcpy(buffer->m_buffer + buffer->m_offset, ptr, bytes); 
+    buffer->m_offset += bytes; 
+}
+
 void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_info, const bcf_hdr_t* hdr)
 {
     char* error_msg = 0;
@@ -737,10 +831,29 @@ void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_i
             assert(data.input_2_global_idx_array[i] >= 0);
         }
     }
+    //Version dependent values
+    switch(mapping_info->m_tiledb_output_version)
+    {
+        case TILEDB_OUTPUT_CSV_V0:
+            g_CSV_MISSING_CHARACTER = '#';
+            mapping_info->m_tiledb_printer = tiledb_csv_printer; 
+            break;
+        case TILEDB_OUTPUT_CSV_V1:
+            g_CSV_MISSING_CHARACTER = '*';
+            mapping_info->m_tiledb_printer = tiledb_csv_printer; 
+            break;
+        case TILEDB_OUTPUT_BINARY_V1:
+            g_CSV_MISSING_CHARACTER = '\0';
+            mapping_info->m_tiledb_printer = tiledb_binary_printer; 
+            break;
+        default:
+            error("Unknown TileDB output format %d\n", mapping_info->m_tiledb_output_version);
+            break;
+    }
 }
 
-#define CSV_MISSING_CHARACTER '#'
-#define CSV_NON_REF_REPRESENTATION "&"
+
+
 int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_output_info,
 	bcf_hdr_t* out_hdr, bcf1_t* line, int input_sample_idx)
 {
@@ -753,20 +866,30 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
     //Buffer to use to call get_info/format_values()
     char** buffer = &(csv_output_info->m_htslib_buffer);
     unsigned* buffer_size = &(csv_output_info->m_htslib_buffer_size);
-
+    //Printer function
+    TileDBPrinterTy TILEDB_CSV_BPRINTF = mapping_info->m_tiledb_printer;
     int contig_id = line->rid;
     ASSERT(mapping_info->input_contig_idx_2_global_idx[contig_id] >= 0);
     uint64_t contig_offset = mapping_info->input_contig_idx_2_offset[contig_id];
+    //old version
+    uint8_t is_old_tiledb_version = (mapping_info->m_tiledb_output_version == TILEDB_OUTPUT_CSV_V0);
+    uint8_t is_tiledb_binary_output = (mapping_info->m_tiledb_output_version == TILEDB_OUTPUT_BINARY_V1);
+    unsigned offset_at_start = csv_out_buffer->m_offset;
+    unsigned cell_size_offset = 0u;
     {
         int num_values = -1;
-#define PRINT_TILEDB_CSV(field_name, bcf_ht_type, get_function, type_t, format_specifier, vector_end_condition, missing_condition)       \
+#define PRINT_TILEDB_CSV(field_name, bcf_ht_type, get_function, type_t, format_specifier, vector_end_condition, missing_condition, fixed_num_values) \
         { \
             int num_elements = (*buffer_size)/sizeof(type_t); \
             num_values = get_function(out_hdr, line, field_name, (void**)buffer, &num_elements, bcf_ht_type); \
             if(num_elements*sizeof(type_t) > (*buffer_size)) \
                 (*buffer_size) = num_elements*sizeof(type_t); \
             if(num_values < 0) \
-                TILEDB_CSV_BPRINTF(csv_out_buffer,",%c",CSV_MISSING_CHARACTER)  \
+            { \
+                int i=0; \
+                for(i=0;i<(fixed_num_values);++i) \
+                    TILEDB_CSV_BPRINTF(csv_out_buffer,bcf_ht_type,0,g_CSV_MISSING_CHARACTER);  \
+            } \
             else \
             { \
                 int k = 0;  \
@@ -774,28 +897,28 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
                 for(k=0;k<num_values;++k)   \
                 {   \
                     type_t val = ptr[k];    \
-                    TILEDB_CSV_BPRINTF(csv_out_buffer,",") \
+                    TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_VOID,","); \
                     if(missing_condition) \
                         continue; \
-                    TILEDB_CSV_BPRINTF(csv_out_buffer,format_specifier,val)  \
+                    TILEDB_CSV_BPRINTF(csv_out_buffer,bcf_ht_type,format_specifier,val);  \
                 }   \
             } \
         }
         //Print co-ordinates : sample id, location
         ASSERT(mapping_info->input_sample_idx_2_global_idx[input_sample_idx] >= 0);
 #ifdef ZERO_BASED_POSITION
-        uint64_t position = contig_offset + ((uint64_t)line->pos);
+        int64_t position = contig_offset + ((uint64_t)line->pos);
 #else
-        uint64_t position = contig_offset + ((uint64_t)line->pos) + 1;
+        int64_t position = contig_offset + ((uint64_t)line->pos) + 1;
 #endif
 	if(sampling_info)
 	{
 	    int random_value = rand();
 	    if(random_value < sampling_info->m_sampling_limit)
-		fprintf(sampling_info->m_spit_random_positions,"%"PRIu64"\n",position);
+		fprintf(sampling_info->m_spit_random_positions,"%"PRIi64"\n",position);
 	    return 0;
 	}
-	uint64_t global_end_position = 0;
+	int64_t global_end_position = 0;
         //get END position
         {
             int num_elements = (*buffer_size)/sizeof(int);
@@ -808,7 +931,7 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
 #ifdef ZERO_BASED_POSITION
                 --end_pos;
 #endif
-		global_end_position = contig_offset + ((uint64_t)end_pos);
+		global_end_position = contig_offset + ((int64_t)end_pos);
             }
         }
 	if(profile_intervals)
@@ -839,62 +962,106 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
         if(!(csv_output_info->m_skip_coordinates))
         {
             //print sample idx and position
-            TILEDB_CSV_BPRINTF(csv_out_buffer,"%"PRIi64",%"PRIu64, mapping_info->input_sample_idx_2_global_idx[input_sample_idx], position)
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT64,"%"PRIi64, mapping_info->input_sample_idx_2_global_idx[input_sample_idx]);
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT64,",%"PRIi64, position);
+            //For binary output, size of total cell is required after co-ordinates
+            //FIXME:The type of size is size_t, assuming 64-bit on 64-bit Linux platforms
+            //Just allocate space for now and update later once the cell size is known
+            if(is_tiledb_binary_output)
+            {
+                cell_size_offset = csv_out_buffer->m_offset;
+                ALLOCATE_SPACE_IN_BUFFER(csv_out_buffer, sizeof(int64_t));
+            }
             //print END position
-            TILEDB_CSV_BPRINTF(csv_out_buffer,",%"PRIu64, global_end_position)
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT64,",%"PRIi64, global_end_position);
         }
-        //print reference allele and number of ALT alleles
-        TILEDB_CSV_BPRINTF(csv_out_buffer,",%s,%d", line->d.allele[0], line->n_allele-1)
+        //For binary, the size of the var:char field must be printed first 
+        //Print length of REF string 
+        if(is_tiledb_binary_output)
+            TILEDB_CSV_BPRINTF(csv_out_buffer, BCF_HT_INT,",%d", strlen(line->d.allele[0]));
+        //print reference allele
+        TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_STR,",%s", line->d.allele[0]);
+        //Position in buffer after REF
+        int after_ref_offset = csv_out_buffer->m_offset;
+        //Separator for ALT alleles
+        char alt_separator = ',';
+        if(is_old_tiledb_version)
+        {
+            //For old versions, print #ALT alleles first
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT,",%d", line->n_allele-1);
+            alt_separator = ',';
+        }
+        else
+            alt_separator = '|';
+        //For binary, the size of the var:char field must be printed first 
+        //Just allocate space for now and update later once the length is known
+        if(is_tiledb_binary_output)
+        {
+            ALLOCATE_SPACE_IN_BUFFER(csv_out_buffer, sizeof(int));
+        }
+        int alt_start_offset = csv_out_buffer->m_offset;
         //print alt alleles
+        TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_VOID,",");   //print comma before first ALT allele
         int j = 0;
         for(j=1;j<line->n_allele;++j)
         {
+            if(j > 1)
+                TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_CHAR,"%c",alt_separator);
             if(strcmp(line->d.allele[j],"<NON_REF>") == 0)
-                TILEDB_CSV_BPRINTF(csv_out_buffer,",%s",CSV_NON_REF_REPRESENTATION)
+                TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_STR,"%s",CSV_NON_REF_REPRESENTATION);
             else
-                TILEDB_CSV_BPRINTF(csv_out_buffer,",%s",line->d.allele[j])
+                TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_STR,"%s",line->d.allele[j]);
+        }
+        //For binary output, print length of concatenated ALT string 
+        if(is_tiledb_binary_output)
+        {
+            int alt_length = csv_out_buffer->m_offset - alt_start_offset;
+            memcpy(csv_out_buffer->m_buffer+after_ref_offset, &alt_length, sizeof(int));
         }
         //print QUAL
         if(bcf_float_is_missing(line->qual))
-            TILEDB_CSV_BPRINTF(csv_out_buffer,",%c",CSV_MISSING_CHARACTER)
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_CHAR,0,g_CSV_MISSING_CHARACTER);
         else
-            TILEDB_CSV_BPRINTF(csv_out_buffer,",%0.3f",line->qual)
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_REAL,",%0.3f",line->qual);
         //print number of filters, followed by filter idx
-        TILEDB_CSV_BPRINTF(csv_out_buffer,",%d",line->d.n_flt)
+        TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT,",%d",line->d.n_flt);
         for(j=0;j<line->d.n_flt;++j)
         {
             ASSERT(line->d.flt[j] >= 0 && line->d.flt[j] < out_hdr->n[BCF_DT_ID]);
             ASSERT(mapping_info->input_field_idx_2_global_idx[line->d.flt[j]] >= 0);
-            TILEDB_CSV_BPRINTF(csv_out_buffer,",%"PRIi64,mapping_info->input_field_idx_2_global_idx[line->d.flt[j]])
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT64,",%"PRIi64,mapping_info->input_field_idx_2_global_idx[line->d.flt[j]]);
         }
         //Print relevant INFO fields
-        PRINT_TILEDB_CSV("BaseQRankSum",BCF_HT_REAL, bcf_get_info_values, float,"%.2f",0,(bcf_float_is_missing(val)));
-        PRINT_TILEDB_CSV("ClippingRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)));
-        PRINT_TILEDB_CSV("MQRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)));
-        PRINT_TILEDB_CSV("ReadPosRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)));
-        PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing));
-        PRINT_TILEDB_CSV("MQ",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)));
-        PRINT_TILEDB_CSV("MQ0",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing));
+        PRINT_TILEDB_CSV("BaseQRankSum",BCF_HT_REAL, bcf_get_info_values, float,"%.2f",0,(bcf_float_is_missing(val)), 1);
+        PRINT_TILEDB_CSV("ClippingRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)), 1);
+        PRINT_TILEDB_CSV("MQRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)), 0);
+        PRINT_TILEDB_CSV("ReadPosRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)), 1);
+        PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing), 1);
+        PRINT_TILEDB_CSV("MQ",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)), 1);
+        PRINT_TILEDB_CSV("MQ0",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing), 1);
         //Print relevant FORMAT fields
-        PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
-        PRINT_TILEDB_CSV("MIN_DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
-        PRINT_TILEDB_CSV("GQ",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
-        PRINT_TILEDB_CSV("SB",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
-        if(num_values < 0)
-            TILEDB_CSV_BPRINTF(csv_out_buffer,",%c,%c,%c",CSV_MISSING_CHARACTER, CSV_MISSING_CHARACTER, CSV_MISSING_CHARACTER)
-        PRINT_TILEDB_CSV("AD",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
-        if(num_values < 0)
-          for(j=0;j<line->n_allele-1;++j)       //missing values for N-1 alleles, as PRINT_TILEDB_CSV would have added one missing char
-            TILEDB_CSV_BPRINTF(csv_out_buffer,",%c",CSV_MISSING_CHARACTER)
-        PRINT_TILEDB_CSV("PL",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing));
-        if(num_values < 0)
-        {
-          int num_gts =(line->n_allele*(line->n_allele+1))/2;
-          for(j=0;j<num_gts-1;++j)//missing values for N-1 GTs, as PRINT_TILEDB_CSV would have added one missing char
-            TILEDB_CSV_BPRINTF(csv_out_buffer,",%c",CSV_MISSING_CHARACTER)
-        }
+        PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing), 1);
+        PRINT_TILEDB_CSV("MIN_DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing), 1);
+        PRINT_TILEDB_CSV("GQ",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing), 1);
+        PRINT_TILEDB_CSV("SB",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing), 4);
+        //For newer versions, print #elements first
+        if(!is_old_tiledb_version)
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT,",%d",line->n_allele);
+        PRINT_TILEDB_CSV("AD",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing), line->n_allele);
+        int num_gts =(line->n_allele*(line->n_allele+1))/2;
+        //For newer versions, print #elements first
+        if(!is_old_tiledb_version)
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT,",%d",num_gts);
+        PRINT_TILEDB_CSV("PL",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing), num_gts);
     }
-    TILEDB_CSV_BPRINTF(csv_out_buffer,"\n")
+    TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_VOID,"\n");
+    //For binary output, print cell size at the correct spot
+    //FIXME: assuming 64 bit size_t on Linux 64 bit
+    if(is_tiledb_binary_output && !(csv_output_info->m_skip_coordinates))
+    {
+        int64_t cell_size = csv_out_buffer->m_offset - offset_at_start;
+        memcpy(csv_out_buffer->m_buffer+cell_size_offset, &cell_size, sizeof(cell_size));
+    }
     unsigned curr_offset = csv_out_buffer->m_offset; 
     //Check if need to write to stream
     FILE* csv_fptr = csv_output_info->m_csv_out_fptr;
@@ -927,6 +1094,7 @@ enum ArgsIdxEnum
   ARGS_IDX_NUM_LINES_IN_VCF,
   ARGS_IDX_QUERY_POSITIONS_FILE,
   ARGS_IDX_PROFILE_GVCF_INTERVALS,
+  ARGS_IDX_TILEDB_OUTPUT_FORMAT,
   ARGS_IDX_TAG
 };
 
@@ -987,6 +1155,7 @@ int main_vcfview(int argc, char *argv[])
         {"num-lines",1,0,ARGS_IDX_NUM_LINES_IN_VCF},
         {"query-positions-file",1,0,ARGS_IDX_QUERY_POSITIONS_FILE},
 	{"profile-gvcf-intervals",0,0,ARGS_IDX_PROFILE_GVCF_INTERVALS},
+        {"tiledb-output-format",1,0,ARGS_IDX_TILEDB_OUTPUT_FORMAT},
         {0,0,0,0}
     };
     char *tmp;
@@ -1124,6 +1293,9 @@ int main_vcfview(int argc, char *argv[])
 	    case ARGS_IDX_PROFILE_GVCF_INTERVALS:
 		profile_intervals->m_do_profiling = 1;
 		break;
+            case ARGS_IDX_TILEDB_OUTPUT_FORMAT:
+                args->m_mapping_info.m_tiledb_output_version = string_to_tiledb_output_version(optarg);
+                break;
             case '?': usage(args);
             default: error("Unknown argument: %s\n", optarg);
         }
