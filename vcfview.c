@@ -91,6 +91,15 @@ typedef struct _args_t
 }
 args_t;
 
+void* allocate_sqlite3_mapping(const char* sqlite_file)
+{
+    sqlite_mappings_struct* mapping_info = (sqlite_mappings_struct*)calloc(1, sizeof(sqlite_mappings_struct));
+    assert(mapping_info);
+    strcpy(mapping_info->sqlite_file, sqlite_file);
+    open_sqlite3_db(sqlite_file, &(mapping_info->db));
+    return (void*)mapping_info;
+}
+
 void open_sqlite3_db(const char* sqlite_file, sqlite3** db)
 {
     if(sqlite_file[0] == '\0')
@@ -293,8 +302,9 @@ void initialize_csv_output_info(csv_output_struct* ptr, FILE* output_fptr, unsig
     ptr->m_htslib_buffer = (char*)malloc(16384);
 }
 
-void free_sqlite3_data(sqlite_mappings_struct* mapping_info)
+void free_sqlite3_data(void* info_ptr)
 {
+    sqlite_mappings_struct* mapping_info = (sqlite_mappings_struct*)info_ptr;
     if(mapping_info->input_field_idx_2_global_idx)
 	free(mapping_info->input_field_idx_2_global_idx);
     if(mapping_info->input_sample_idx_2_global_idx)
@@ -305,6 +315,12 @@ void free_sqlite3_data(sqlite_mappings_struct* mapping_info)
 	free(mapping_info->input_contig_idx_2_offset);
     if(mapping_info->db)
 	sqlite3_close(mapping_info->db);
+    if(mapping_info->m_field_names)
+        free(mapping_info->m_field_names);
+    if(mapping_info->m_contig_names)
+        free(mapping_info->m_contig_names);
+    if(mapping_info->m_contig_lengths)
+        free(mapping_info->m_contig_lengths);
     memset(mapping_info, 0, sizeof(sqlite_mappings_struct));
 }
 
@@ -600,49 +616,6 @@ static void usage(args_t *args)
     exit(1);
 }
 
-typedef struct
-{
-  int input_idx;
-  uint64_t contig_length;
-  int64_t* input_2_global_idx_array;
-  uint64_t* contig_offsets;
-}sqlite_data_struct;
-
-int sqlite_handler(void* ptr, int num_columns, char** field_values, char** column_names)
-{
-  assert(num_columns == 1);
-  int64_t global_idx = strtoll(field_values[0], 0, 10);
-  sqlite_data_struct* data = (sqlite_data_struct*)ptr;
-  data->input_2_global_idx_array[data->input_idx] = global_idx;
-  return 0;
-}
-
-int contig_sqlite_handler(void* ptr, int num_columns, char** field_values, char** column_names)
-{
-    assert(num_columns == 3);
-    if(sqlite_handler(ptr, 1, field_values, column_names) != 0)
-        return -1;
-    sqlite_data_struct* data = (sqlite_data_struct*)ptr;
-    data->contig_length = strtoull(field_values[1], 0, 10);
-    data->contig_offsets[data->input_idx] = strtoull(field_values[2], 0, 10);
-    return 0;
-}
-
-typedef struct
-{
-    uint64_t contig_offset;
-    uint64_t contig_length;
-}max_contig_data_struct;
-
-int max_contig_offset_sqlite_handler(void* ptr, int num_columns, char** field_values, char** column_names)
-{
-    assert(num_columns == 2);
-    max_contig_data_struct* data = (max_contig_data_struct*)ptr;
-    data->contig_length = strtoll(field_values[0], 0, 10);
-    data->contig_offset = strtoll(field_values[1], 0, 10);
-    return 0;
-}
-
 #define ZERO_BASED_POSITION 1
 #define ZERO_BASED_SAMPLE_IDS 1
 unsigned char g_CSV_MISSING_CHARACTER='#';
@@ -738,40 +711,76 @@ void tiledb_binary_printer(buffer_wrapper* buffer, unsigned bcf_ht_type, const c
     buffer->m_offset += bytes; 
 }
 
-void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_info, const bcf_hdr_t* hdr)
+typedef struct
 {
-    char* error_msg = 0;
-    char query_string[4096];
-    char insert_string[4096];
-    sqlite_data_struct data;
-    
-    //max contig offset
-    const char* max_contig_offset_query = "select contig_length, contig_offset from contig_names order by contig_offset desc limit 1;";
-    max_contig_data_struct max_contig;
-    //First time
-    max_contig.contig_offset = 0ull;
-    max_contig.contig_length = 0ull;
+  int input_idx;
+  int64_t contig_length;
+  int64_t* input_2_global_idx_array;
+  int64_t* contig_offsets;
+}sqlite_data_struct;
 
+int sqlite_handler(void* ptr, int num_columns, char** field_values, char** column_names)
+{
+  assert(num_columns == 1);
+  int64_t global_idx = strtoll(field_values[0], 0, 10);
+  sqlite_data_struct* data = (sqlite_data_struct*)ptr;
+  data->input_2_global_idx_array[data->input_idx] = global_idx;
+  return 0;
+}
+
+int contig_sqlite_handler(void* ptr, int num_columns, char** field_values, char** column_names)
+{
+    assert(num_columns == 3);
+    if(sqlite_handler(ptr, 1, field_values, column_names) != 0)
+        return -1;
+    sqlite_data_struct* data = (sqlite_data_struct*)ptr;
+    data->contig_length = strtoull(field_values[1], 0, 10);
+    data->contig_offsets[data->input_idx] = strtoull(field_values[2], 0, 10);
+    return 0;
+}
+
+typedef struct
+{
+    int64_t contig_offset;
+    int64_t contig_length;
+}max_contig_data_struct;
+
+int max_contig_offset_sqlite_handler(void* ptr, int num_columns, char** field_values, char** column_names)
+{
+    assert(num_columns == 2);
+    max_contig_data_struct* data = (max_contig_data_struct*)ptr;
+    data->contig_length = strtoll(field_values[0], 0, 10);
+    data->contig_offset = strtoll(field_values[1], 0, 10);
+    return 0;
+}
+
+#define COMMON_QUERY_VARIABLE_DECLARATION \
+    sqlite_mappings_struct* mapping_info = (sqlite_mappings_struct*)info_ptr; \
+    char* error_msg = 0; \
+    char query_string[4096]; \
+    char insert_string[4096]; \
+    sqlite_data_struct data; \
     int i = 0;
 
-    mapping_info->input_sample_idx_2_global_idx = (int64_t*)malloc(bcf_hdr_nsamples(hdr)*sizeof(int64_t));
-    memset(mapping_info->input_sample_idx_2_global_idx, -1, bcf_hdr_nsamples(hdr)*sizeof(int64_t));  //initialize to -1
-    mapping_info->input_field_idx_2_global_idx = (int64_t*)malloc(hdr->n[BCF_DT_ID]*sizeof(int64_t));
-    memset(mapping_info->input_field_idx_2_global_idx, -1,hdr->n[BCF_DT_ID]*sizeof(int64_t));        //initialize to -1 
-    mapping_info->input_contig_idx_2_global_idx = (int64_t*)malloc(hdr->n[BCF_DT_CTG]*sizeof(int64_t));
-    memset(mapping_info->input_contig_idx_2_global_idx, -1, hdr->n[BCF_DT_CTG]*sizeof(int64_t));     //initialize to -1
-    mapping_info->input_contig_idx_2_offset = (uint64_t*)malloc(hdr->n[BCF_DT_CTG]*sizeof(uint64_t));
-
+int64_t* query_samples_idx(void* info_ptr, int n_samples, const char* const* sample_names)
+{
+    COMMON_QUERY_VARIABLE_DECLARATION; 
+    //Memory allocation for mappings
+    if(n_samples)
+    {
+        mapping_info->input_sample_idx_2_global_idx = (int64_t*)realloc(mapping_info->input_sample_idx_2_global_idx, n_samples*sizeof(int64_t));
+        memset(mapping_info->input_sample_idx_2_global_idx, -1, n_samples*sizeof(int64_t));  //initialize to -1
+    }
     //Samples 
     data.input_2_global_idx_array = mapping_info->input_sample_idx_2_global_idx;
-    for(i=0;i<bcf_hdr_nsamples(hdr);++i)
+    for(i=0;i<n_samples;++i)
     {
         data.input_idx = i; 
-        sprintf(query_string,"select sample_idx from sample_names where sample_names.sample_name == \"%s\";",hdr->samples[i]);
+        sprintf(query_string,"select sample_idx from sample_names where sample_names.sample_name == \"%s\";",sample_names[i]);
         sqlite3_exec(mapping_info->db, query_string, sqlite_handler, &data, &error_msg);
         if(data.input_2_global_idx_array[i] == -1)
         {
-            sprintf(insert_string,"insert into sample_names (sample_name) values( \"%s\" );",hdr->samples[i]);
+            sprintf(insert_string,"insert into sample_names (sample_name) values( \"%s\" );",sample_names[i]);
             sqlite3_exec(mapping_info->db, insert_string, 0, 0, &error_msg);
             sqlite3_exec(mapping_info->db, query_string, sqlite_handler, &data, &error_msg);
             assert(data.input_2_global_idx_array[i] >= 0);
@@ -779,58 +788,122 @@ void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_i
 #ifdef ZERO_BASED_SAMPLE_IDS
         --(mapping_info->input_sample_idx_2_global_idx[i]);
 #endif
-    }
+    } 
+    return mapping_info->input_sample_idx_2_global_idx;
+}
 
+int64_t* query_contigs_offset(void* info_ptr, int n_contigs, const char* const* contig_names, const uint64_t* contig_lengths)
+{
+    COMMON_QUERY_VARIABLE_DECLARATION; 
+    //max contig offset
+    const char* max_contig_offset_query = "select contig_length, contig_offset from contig_names order by contig_offset desc limit 1;";
+    max_contig_data_struct max_contig;
+    //First time
+    max_contig.contig_offset = 0ull;
+    max_contig.contig_length = 0ull;
+    //Memory allocation for mappings
+    if(n_contigs)
+    {
+        mapping_info->input_contig_idx_2_global_idx = (int64_t*)realloc(mapping_info->input_contig_idx_2_global_idx, n_contigs*sizeof(int64_t));
+        memset(mapping_info->input_contig_idx_2_global_idx, -1, n_contigs*sizeof(int64_t));     //initialize to -1
+        mapping_info->input_contig_idx_2_offset = (int64_t*)realloc(mapping_info->input_contig_idx_2_offset, n_contigs*sizeof(uint64_t));
+    }
     //Contigs
     data.input_2_global_idx_array = mapping_info->input_contig_idx_2_global_idx;
     data.contig_offsets = mapping_info->input_contig_idx_2_offset;
-    for(i=0;i<hdr->n[BCF_DT_CTG];++i)
+    for(i=0;i<n_contigs;++i)
     {
-        uint64_t curr_contig_length = bcf_hdr_id2contig_length(hdr, i);
-        assert(curr_contig_length > 0);
         //query
         data.input_idx = i; 
         sprintf(query_string,"select contig_idx,contig_length,contig_offset from contig_names where contig_names.contig_name == \"%s\";",
-                bcf_hdr_int2id(hdr, BCF_DT_CTG, i));
+                contig_names[i]);
         sqlite3_exec(mapping_info->db, query_string, contig_sqlite_handler, &data, &error_msg);
-        //why the retry?
-        //the schema forces contig_offset to have unique values, if multiple inserts are tried in parallel, only one will succeed 
-        while(data.input_2_global_idx_array[i] == -1)
+        //Contig does not exist in DB
+        if(data.input_2_global_idx_array[i] == -1)
         {
-            //get max offset value from SQL
-            sqlite3_exec(mapping_info->db, max_contig_offset_query, max_contig_offset_sqlite_handler, &max_contig, &error_msg);
-            //Compute offset for new entry and insert
-            sprintf(insert_string,"insert into contig_names (contig_name, contig_length, contig_offset) values( \"%s\",%" PRIu64 ",%" PRIu64 " );",
-                    bcf_hdr_int2id(hdr, BCF_DT_CTG, i), curr_contig_length, max_contig.contig_offset + max_contig.contig_length);
-            error_msg = 0;
-            //May fail because of parallel insert
-            if(sqlite3_exec(mapping_info->db, insert_string, 0, 0, &error_msg) == SQLITE_OK)
+            assert(contig_lengths);     //should be non-NULL
+            uint64_t curr_contig_length = contig_lengths[i];
+            assert(curr_contig_length > 0);
+            //why the retry?
+            //the schema forces contig_offset to have unique values, if multiple inserts are tried in parallel, only one will succeed 
+            while(data.input_2_global_idx_array[i] == -1)
             {
-                sqlite3_exec(mapping_info->db, query_string, contig_sqlite_handler, &data, &error_msg);
-                assert(data.input_2_global_idx_array[i] >= 0);
+                //get max offset value from SQL
+                sqlite3_exec(mapping_info->db, max_contig_offset_query, max_contig_offset_sqlite_handler, &max_contig, &error_msg);
+                //Compute offset for new entry and insert
+                sprintf(insert_string,"insert into contig_names (contig_name, contig_length, contig_offset) values( \"%s\",%" PRIu64 ",%" PRIu64 " );",
+                        contig_names[i], curr_contig_length, max_contig.contig_offset + max_contig.contig_length);
+                error_msg = 0;
+                //May fail because of parallel insert
+                if(sqlite3_exec(mapping_info->db, insert_string, 0, 0, &error_msg) == SQLITE_OK)
+                {
+                    sqlite3_exec(mapping_info->db, query_string, contig_sqlite_handler, &data, &error_msg);
+                    assert(data.input_2_global_idx_array[i] >= 0);
+                }
+                else
+                    if(error_msg)
+                        free(error_msg);
             }
-            else
-                if(error_msg)
-                    free(error_msg);
         }
-        assert(data.contig_length == curr_contig_length);       //should be same as current contig
+        if(contig_lengths)
+            assert(data.contig_length == contig_lengths[i]);       //should be same as current contig
     }
+    return mapping_info->input_contig_idx_2_offset;
+}
 
+int64_t* query_fields_idx(void* info_ptr, int n_fields, const char* const* field_names)
+{
+    COMMON_QUERY_VARIABLE_DECLARATION; 
+    if(n_fields)
+    {
+        mapping_info->input_field_idx_2_global_idx = (int64_t*)realloc(mapping_info->input_field_idx_2_global_idx, n_fields*sizeof(int64_t));
+        memset(mapping_info->input_field_idx_2_global_idx, -1,n_fields*sizeof(int64_t));        //initialize to -1 
+    }
     //INFO/FILTER/FORMAT fields
     data.input_2_global_idx_array = mapping_info->input_field_idx_2_global_idx;
-    for(i=0;i<hdr->n[BCF_DT_ID];++i)
+    for(i=0;i<n_fields;++i)
     {
         data.input_idx = i; 
-        sprintf(query_string,"select field_idx from field_names where field_names.field_name == \"%s\";",bcf_hdr_int2id(hdr, BCF_DT_ID, i));
+        sprintf(query_string,"select field_idx from field_names where field_names.field_name == \"%s\";", field_names[i]);
         sqlite3_exec(mapping_info->db, query_string, sqlite_handler, &data, &error_msg);
         if(data.input_2_global_idx_array[i] == -1)
         {
-            sprintf(insert_string,"insert into field_names (field_name) values( \"%s\" );",bcf_hdr_int2id(hdr, BCF_DT_ID, i));
+            sprintf(insert_string,"insert into field_names (field_name) values( \"%s\" );", field_names[i]);
             sqlite3_exec(mapping_info->db, insert_string, 0, 0, &error_msg);
             sqlite3_exec(mapping_info->db, query_string, sqlite_handler, &data, &error_msg);
             assert(data.input_2_global_idx_array[i] >= 0);
         }
     }
+    return mapping_info->input_field_idx_2_global_idx;
+}
+
+void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_info, const bcf_hdr_t* hdr)
+{
+    int n_samples = bcf_hdr_nsamples(hdr);
+    int n_fields = hdr->n[BCF_DT_ID];
+    int n_contigs = hdr->n[BCF_DT_CTG];
+    char** ptr = 0;
+    //Allocate arrays to store field and contig names
+    mapping_info->m_field_names = (char**)malloc(n_fields*sizeof(char*));
+    mapping_info->m_contig_names = (char**)malloc(n_contigs*sizeof(char*));
+    mapping_info->m_contig_lengths = (uint64_t*)malloc(n_contigs*sizeof(uint64_t));
+
+    int i = 0;
+    //Contigs
+    ptr = mapping_info->m_contig_names;
+    for(i=0;i<hdr->n[BCF_DT_CTG];++i)
+    {
+        ptr[i] = (char*)(bcf_hdr_int2id(hdr, BCF_DT_CTG, i));
+        mapping_info->m_contig_lengths[i] = bcf_hdr_id2contig_length(hdr, i); 
+    }
+    //Fields
+    ptr = mapping_info->m_field_names;
+    for(i=0;i<hdr->n[BCF_DT_ID];++i)
+        ptr[i] = (char*)(bcf_hdr_int2id(hdr, BCF_DT_ID, i));
+    //Query samples, contigs and fields
+    query_samples_idx(mapping_info, n_samples, (const char* const*)(hdr->samples));
+    query_contigs_offset(mapping_info, n_contigs, (const char* const*)(mapping_info->m_contig_names), mapping_info->m_contig_lengths);
+    query_fields_idx(mapping_info, n_fields, (const char* const*)(mapping_info->m_field_names));
     //Version dependent values
     switch(mapping_info->m_tiledb_output_version)
     {
@@ -870,7 +943,7 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
     TileDBPrinterTy TILEDB_CSV_BPRINTF = mapping_info->m_tiledb_printer;
     int contig_id = line->rid;
     ASSERT(mapping_info->input_contig_idx_2_global_idx[contig_id] >= 0);
-    uint64_t contig_offset = mapping_info->input_contig_idx_2_offset[contig_id];
+    int64_t contig_offset = mapping_info->input_contig_idx_2_offset[contig_id];
     //old version
     uint8_t is_old_tiledb_version = (mapping_info->m_tiledb_output_version == TILEDB_OUTPUT_CSV_V0);
     uint8_t is_tiledb_binary_output = (mapping_info->m_tiledb_output_version == TILEDB_OUTPUT_BINARY_V1);

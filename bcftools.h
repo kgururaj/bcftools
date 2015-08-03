@@ -115,10 +115,17 @@ extern "C"
     unsigned m_tiledb_output_version;
     //Pointer to printer function
     TileDBPrinterTy m_tiledb_printer;
+    //List of field names
+    char** m_field_names;
+    char** m_contig_names;
+    uint64_t* m_contig_lengths;
+    //Mappings
+    //Value in ith position specifies global sample idx in SQLite DB for ith
+    //sample in the query array
     int64_t* input_sample_idx_2_global_idx;
     int64_t* input_field_idx_2_global_idx;
     int64_t* input_contig_idx_2_global_idx;
-    uint64_t* input_contig_idx_2_offset;
+    int64_t* input_contig_idx_2_offset;
     char sqlite_file[1024];
     sqlite3* db;
   }sqlite_mappings_struct;
@@ -187,8 +194,30 @@ extern "C"
 
   void open_sqlite3_db(const char* sqlite_file, sqlite3** db);
   void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_info, const bcf_hdr_t* hdr);
+  /*
+   * Allocate sqlite_mappings_struct and open SQLite file
+   * @return Pointer to sqlite_mappings_struct with opened sqlite_file
+   * */
+  void* allocate_sqlite3_mapping(const char* sqlite_file);
+  /*
+   * Query sqlite DB function
+   * @param info_ptr: sqlite_mappings_struct* returned by allocate_sqlite3_mapping() function. Members of this structure
+   * are modified by this function
+   * @param n_samples: #samples being queried
+   * @param sample_names: array of sample names char**
+   * @param contig_lengths: if the query is expected to add new contigs to the
+   * SQLite DB, then this arg should point to an array of contig lengths. Can
+   * be NULL, if no updates are expected to be performed.
+   * @return Pointer to array containing result of query
+   * */
+  int64_t* query_samples_idx(void* info_ptr, int n_samples, const char* const* sample_names);
+  int64_t* query_contigs_offset(void* info_ptr, int n_contigs, const char* const* contig_names, const uint64_t* contig_lengths);
+  int64_t* query_fields_idx(void* info_ptr, int n_fields, const char* const* field_names);
+  /*
+   * Free members of sqlite_mappings_struct info_ptr
+   */
+  void free_sqlite3_data(void* info_ptr);
   void initialize_csv_output_info(csv_output_struct* ptr, FILE* output_fptr, unsigned buffer_size, uint8_t reset);
-  void free_sqlite3_data(sqlite_mappings_struct* mapping_info);
   void free_csv_output_info(csv_output_struct* info);
   //Write CSV line for a single sample (input_sample_idx)
   int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_output_info,

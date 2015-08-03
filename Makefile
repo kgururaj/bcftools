@@ -56,7 +56,7 @@ ifdef PROFILE
     LIBS += -Wl,-Bstatic -L$(GPERFTOOLSDIR)/lib -lprofiler -Wl,-Bdynamic  -lunwind -lstdc++
     #CFLAGS += -pg
 endif
-CFLAGS+=	-Wall -Wc++-compat
+CFLAGS+=	-Wall -Wc++-compat -fPIC
 LDFLAGS=
 LIB_OBJS     = vcfindex.o tabix.o \
            vcfstats.o vcfisec.o vcfmerge.o vcfdiff.o vcfPLmedian.o vcfquery.o vcffilter.o filter.o vcfsom.o \
@@ -95,7 +95,7 @@ INSTALL_DATA    = $(INSTALL) -m 644
 INSTALL_DIR     = $(MKDIR_P) -m 755
 
 
-all:$(PROG) libbcftools.a plugins
+all:$(PROG) libbcftools.a plugins libbcftools.so
 
 # See htslib/Makefile
 PACKAGE_VERSION = 1.2
@@ -191,6 +191,9 @@ test/test-rbuf: test/test-rbuf.o
 libbcftools.a: $(HTSLIB) $(LIB_OBJS)
 	ar rcs libbcftools.a $(LIB_OBJS)
 
+libbcftools.so: $(HTSLIB) $(LIB_OBJS)
+	gcc -shared -o libbcftools.so $(LIB_OBJS)
+
 bcftools: $(HTSLIB) $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) -Wl,-Bstatic -L$(HTSDIR) -lhts -Wl,-Bdynamic -lpthread -lz -lm -ldl $(GSL_LIBS) $(LIBS)
 
@@ -215,7 +218,7 @@ install: $(PROG)
 	$(INSTALL_PROGRAM) plugins/*.so $(DESTDIR)$(plugindir)
 
 clean: testclean clean-plugins
-	-rm -f gmon.out *.o *~ $(PROG) version.h plugins/*.so plugins/*.P
+	-rm -f gmon.out *.o *~ $(PROG) version.h plugins/*.so plugins/*.P libbcftools*
 	-rm -rf *.dSYM plugins/*.dSYM test/*.dSYM
 
 clean-plugins:

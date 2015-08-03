@@ -9,3 +9,4 @@ plugins/*.P
 /TAGS
 /.tags
 *.a
+*.so
