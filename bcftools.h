@@ -210,6 +210,14 @@ extern "C"
    * */
   void query_sample_name(void* info_ptr, int64_t sample_idx, char* sample_name);
   /*
+   * Given a column idx, get contig name
+   * Space for contig_name must be allocated by caller
+   * @param info_ptr: sqlite_mappings_struct* returned by allocate_sqlite3_mapping() function. Members of this structure
+   * are modified by this function
+   * @return position in contig (zero-based)
+   * */
+  int64_t query_contig_name(void* info_ptr, int64_t column_idx, char* contig_name);
+  /*
    * Query sqlite DB function
    * @param info_ptr: sqlite_mappings_struct* returned by allocate_sqlite3_mapping() function. Members of this structure
    * are modified by this function

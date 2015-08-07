@@ -17,6 +17,10 @@ main(int argc, char** argv)
     const char* contig_names[] = { "1", "X" };
     const int64_t* contig_offset = query_contigs_offset(ptr, 2, contig_names, 0);
     printf("TileDB column ids for contigs 1 and X : %"PRIi64" and %"PRIi64"\n", contig_offset[0], contig_offset[1]);
+    //Given TileDB column, get contig name and position within contig (0-based)
+    char contig_result[100];
+    int64_t contig_pos = query_contig_name(ptr, 249250621, contig_result);
+    printf("Contig name, pos for TileDB column idx %"PRIi64" :  %s,%"PRIi64"\n", 249250621, contig_result, contig_pos);
     //Free internals of the structure
     free_sqlite3_data(ptr);
     //Free the structure

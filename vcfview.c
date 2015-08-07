@@ -739,11 +739,11 @@ int contig_sqlite_handler(void* ptr, int num_columns, char** field_values, char*
     return 0;
 }
 
-int sqlite_sample_name_handler(void* ptr, int num_columns, char** field_values, char** column_names)
+int sqlite_name_handler(void* ptr, int num_columns, char** field_values, char** column_names)
 {
   assert(num_columns == 1);
-  char* sample_name = (char*)ptr;
-  strcpy(sample_name, field_values[0]);
+  char* name = (char*)ptr;
+  strcpy(name, field_values[0]);
   return 0;
 }
 
@@ -779,9 +779,42 @@ void query_sample_name(void* info_ptr, int64_t sample_idx, char* sample_name)
     ++sample_idx;
 #endif
     sample_name[0] = '\0';
-    sprintf(query_string,"select sample_name from sample_names where sample_names.sample_idx == \"%"PRIi64"\";",sample_idx);
-    sqlite3_exec(mapping_info->db, query_string, sqlite_sample_name_handler, sample_name, &error_msg);
+    sprintf(query_string,"select sample_name from sample_names where sample_names.sample_idx == %"PRIi64";",sample_idx);
+    sqlite3_exec(mapping_info->db, query_string, sqlite_name_handler, sample_name, &error_msg);
     assert(sample_name[0] != '\0');
+}
+
+typedef struct
+{
+    int64_t m_contig_offset;
+    char* m_contig_name;
+} contig_name_offset_struct;
+
+int sqlite_contig_name_offset_handler(void* ptr, int num_columns, char** field_values, char** column_names)
+{
+  assert(num_columns == 2);
+  contig_name_offset_struct* data = (contig_name_offset_struct*)ptr;
+  strcpy(data->m_contig_name, field_values[0]);
+  data->m_contig_offset = strtoll(field_values[1], 0, 10);
+  return 0;
+}
+
+int64_t query_contig_name(void* info_ptr, int64_t column_idx, char* contig_name)
+{
+    sqlite_mappings_struct* mapping_info = (sqlite_mappings_struct*)info_ptr;
+    char* error_msg = 0;
+    char query_string[4096];
+    contig_name_offset_struct data;
+    data.m_contig_name = contig_name;
+    data.m_contig_offset = column_idx;
+#ifndef ZERO_BASED_POSITION
+    --column_idx;
+#endif
+    contig_name[0] = '\0';
+    sprintf(query_string,"select contig_name,contig_offset from contig_names where contig_names.contig_offset<=%"PRIi64" and contig_names.contig_offset+contig_names.contig_length > %"PRIi64";",column_idx, column_idx);
+    sqlite3_exec(mapping_info->db, query_string, sqlite_contig_name_offset_handler, &data, &error_msg);
+    assert(contig_name[0] != '\0');
+    return (column_idx - data.m_contig_offset);
 }
 
 const int64_t* query_samples_idx(void* info_ptr, int n_samples, const char* const* sample_names)
