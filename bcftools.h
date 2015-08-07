@@ -193,12 +193,22 @@ extern "C"
   } csv_output_struct;
 
   void open_sqlite3_db(const char* sqlite_file, sqlite3** db);
-  void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_info, const bcf_hdr_t* hdr);
   /*
    * Allocate sqlite_mappings_struct and open SQLite file
    * @return Pointer to sqlite_mappings_struct with opened sqlite_file
    * */
   void* allocate_sqlite3_mapping(const char* sqlite_file);
+  /*
+   * Initialize mappings for VCF header 
+   **/
+  void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_info, const bcf_hdr_t* hdr);
+  /*
+   * Given a row idx, get sample name
+   * Space for sample_name must be allocated by caller
+   * @param info_ptr: sqlite_mappings_struct* returned by allocate_sqlite3_mapping() function. Members of this structure
+   * are modified by this function
+   * */
+  void query_sample_name(void* info_ptr, int64_t sample_idx, char* sample_name);
   /*
    * Query sqlite DB function
    * @param info_ptr: sqlite_mappings_struct* returned by allocate_sqlite3_mapping() function. Members of this structure
@@ -208,11 +218,11 @@ extern "C"
    * @param contig_lengths: if the query is expected to add new contigs to the
    * SQLite DB, then this arg should point to an array of contig lengths. Can
    * be NULL, if no updates are expected to be performed.
-   * @return Pointer to array containing result of query
+   * @return Pointer to array containing result of query. This pointer is managed by the bcftools code. Do not free etc
    * */
-  int64_t* query_samples_idx(void* info_ptr, int n_samples, const char* const* sample_names);
-  int64_t* query_contigs_offset(void* info_ptr, int n_contigs, const char* const* contig_names, const uint64_t* contig_lengths);
-  int64_t* query_fields_idx(void* info_ptr, int n_fields, const char* const* field_names);
+  const int64_t* query_samples_idx(void* info_ptr, int n_samples, const char* const* sample_names);
+  const int64_t* query_contigs_offset(void* info_ptr, int n_contigs, const char* const* contig_names, const uint64_t* contig_lengths);
+  const int64_t* query_fields_idx(void* info_ptr, int n_fields, const char* const* field_names);
   /*
    * Free members of sqlite_mappings_struct info_ptr
    */

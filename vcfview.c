@@ -739,6 +739,14 @@ int contig_sqlite_handler(void* ptr, int num_columns, char** field_values, char*
     return 0;
 }
 
+int sqlite_sample_name_handler(void* ptr, int num_columns, char** field_values, char** column_names)
+{
+  assert(num_columns == 1);
+  char* sample_name = (char*)ptr;
+  strcpy(sample_name, field_values[0]);
+  return 0;
+}
+
 typedef struct
 {
     int64_t contig_offset;
@@ -762,7 +770,21 @@ int max_contig_offset_sqlite_handler(void* ptr, int num_columns, char** field_va
     sqlite_data_struct data; \
     int i = 0;
 
-int64_t* query_samples_idx(void* info_ptr, int n_samples, const char* const* sample_names)
+void query_sample_name(void* info_ptr, int64_t sample_idx, char* sample_name)
+{
+    sqlite_mappings_struct* mapping_info = (sqlite_mappings_struct*)info_ptr;
+    char* error_msg = 0;
+    char query_string[4096];
+#ifdef ZERO_BASED_SAMPLE_IDS
+    ++sample_idx;
+#endif
+    sample_name[0] = '\0';
+    sprintf(query_string,"select sample_name from sample_names where sample_names.sample_idx == \"%"PRIi64"\";",sample_idx);
+    sqlite3_exec(mapping_info->db, query_string, sqlite_sample_name_handler, sample_name, &error_msg);
+    assert(sample_name[0] != '\0');
+}
+
+const int64_t* query_samples_idx(void* info_ptr, int n_samples, const char* const* sample_names)
 {
     COMMON_QUERY_VARIABLE_DECLARATION; 
     //Memory allocation for mappings
@@ -792,7 +814,7 @@ int64_t* query_samples_idx(void* info_ptr, int n_samples, const char* const* sam
     return mapping_info->input_sample_idx_2_global_idx;
 }
 
-int64_t* query_contigs_offset(void* info_ptr, int n_contigs, const char* const* contig_names, const uint64_t* contig_lengths)
+const int64_t* query_contigs_offset(void* info_ptr, int n_contigs, const char* const* contig_names, const uint64_t* contig_lengths)
 {
     COMMON_QUERY_VARIABLE_DECLARATION; 
     //max contig offset
@@ -851,7 +873,7 @@ int64_t* query_contigs_offset(void* info_ptr, int n_contigs, const char* const* 
     return mapping_info->input_contig_idx_2_offset;
 }
 
-int64_t* query_fields_idx(void* info_ptr, int n_fields, const char* const* field_names)
+const int64_t* query_fields_idx(void* info_ptr, int n_fields, const char* const* field_names)
 {
     COMMON_QUERY_VARIABLE_DECLARATION; 
     if(n_fields)
