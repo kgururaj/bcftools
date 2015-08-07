@@ -778,11 +778,10 @@ static int info_rules_add_values(args_t *args, bcf_hdr_t *hdr, bcf1_t *line, inf
 
 int bcf_hdr_sync(bcf_hdr_t *h);
 
-void bcf_hdr_merge(bcf_hdr_t *hw, const bcf_hdr_t *hr, const char *clash_prefix, int force_samples)
+void merge_headers(bcf_hdr_t *hw, const bcf_hdr_t *hr, const char *clash_prefix, int force_samples)
 {
     // header lines
-    int ret = bcf_hdr_combine(hw, hr);
-    if ( ret!=0 ) error("Error occurred while merging the headers.\n");
+    hw = bcf_hdr_merge(hw, hr);
 
     // samples
     int i;
@@ -3690,7 +3689,7 @@ void merge_vcf(args_t *args)
             }
             else                //else point to same header
                 args->files->readers[i].processed_header = args->files->readers[i].header;
-            bcf_hdr_merge(args->out_hdr, hdr, buf, args->force_samples);
+            merge_headers(args->out_hdr, hdr, buf, args->force_samples);
         }
         bcf_hdr_append_version(args->out_hdr, args->argc, args->argv, "bcftools_merge");
         bcf_hdr_sync(args->out_hdr);

@@ -261,8 +261,11 @@ This command allows to add or remove annotations.
     can be edited, where INFO tags can be written both as "INFO/TAG" or simply "TAG",
     and FORMAT tags can be written as "FORMAT/TAG" or "FMT/TAG".
     To carry over all INFO annotations, use "INFO". To add all INFO annotations except
-    "TAG", use "&#94;INFO/TAG". By default, existing values are replaced. To add
-    values without overwriting existing annotations, use "+TAG" instead of "TAG".
+    "TAG", use "&#94;INFO/TAG". By default, existing values are replaced.
+    To add annotations without overwriting existing values (that is, to add missing tags or
+    add values to existing tags with missing values), use "+TAG" instead of "TAG".
+    To append to existing values (rather than replacing or leaving untouched), use "=TAG"
+    (instead of "TAG" or "+TAG").
     To replace only existing values without modifying missing annotations, use "-TAG".
     If the annotation file is not a VCF/BCF, all new annotations must be
     defined via *-h, --header-lines*.
@@ -476,9 +479,15 @@ the *-a, --allow-overlaps* option is specified.
 *-a, --allow-overlaps*::
     First coordinate of the next file can precede last record of the current file.
 
-*-D, --remove-duplicates*::
-    If a record is present in multiple files, output only the first instance.
+*-c, --compact-PS*::
+    Do not output PS tag at each site, only at the start of a new phase set block.
+
+*-d, --rm-dups* 'snps'|'indels'|'both'|'all'|'none'::
+    Output duplicate records of specified type present in multiple files only once.
     Requires *-a, --allow-overlaps*.
+
+*-D, --remove-duplicates*::
+    Alias for *-d none*
 
 *-f, --file-list* 'FILE'::
     Read the list of files from a file.
