@@ -1006,7 +1006,7 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
     unsigned cell_size_offset = 0u;
     {
         int num_values = -1;
-#define PRINT_TILEDB_CSV(field_name, bcf_ht_type, get_function, type_t, format_specifier, vector_end_condition, missing_condition, fixed_num_values) \
+#define PRINT_TILEDB_CSV(field_name, bcf_ht_type, get_function, type_t, format_specifier, vector_end_condition, missing_condition, length_descriptor, fixed_num_values) \
         { \
             int num_elements = (*buffer_size)/sizeof(type_t); \
             num_values = get_function(out_hdr, line, field_name, (void**)buffer, &num_elements, bcf_ht_type); \
@@ -1014,12 +1014,21 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
                 (*buffer_size) = num_elements*sizeof(type_t); \
             if(num_values < 0) \
             { \
-                int i=0; \
-                for(i=0;i<(fixed_num_values);++i) \
-                    TILEDB_CSV_BPRINTF(csv_out_buffer,bcf_ht_type,0,g_CSV_MISSING_CHARACTER);  \
+                /*For newer versions, for attributes with variable# elements, print #elements first*/ \
+                if(length_descriptor != BCF_VL_FIXED && !is_old_tiledb_version) \
+                    TILEDB_CSV_BPRINTF(csv_out_buffer,bcf_ht_type,",0"); \
+                else \
+                { \
+                    int i=0; \
+                    for(i=0;i<(fixed_num_values);++i) \
+                        TILEDB_CSV_BPRINTF(csv_out_buffer,bcf_ht_type,0,g_CSV_MISSING_CHARACTER);  \
+                } \
             } \
             else \
             { \
+                /*For newer versions, for attributes with variable# elements, print #elements first*/ \
+                if(length_descriptor != BCF_VL_FIXED && !is_old_tiledb_version) \
+                    TILEDB_CSV_BPRINTF(csv_out_buffer,bcf_ht_type,",%d",num_values); \
                 int k = 0;  \
                 type_t* ptr = (type_t*)(*buffer);      \
                 for(k=0;k<num_values;++k)   \
@@ -1160,27 +1169,21 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
             TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT64,",%"PRIi64,mapping_info->input_field_idx_2_global_idx[line->d.flt[j]]);
         }
         //Print relevant INFO fields
-        PRINT_TILEDB_CSV("BaseQRankSum",BCF_HT_REAL, bcf_get_info_values, float,"%.2f",0,(bcf_float_is_missing(val)), 1);
-        PRINT_TILEDB_CSV("ClippingRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)), 1);
-        PRINT_TILEDB_CSV("MQRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)), 0);
-        PRINT_TILEDB_CSV("ReadPosRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)), 1);
-        PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing), 1);
-        PRINT_TILEDB_CSV("MQ",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)), 1);
-        PRINT_TILEDB_CSV("MQ0",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing), 1);
+        PRINT_TILEDB_CSV("BaseQRankSum",BCF_HT_REAL, bcf_get_info_values, float,"%.2f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED,1);
+        PRINT_TILEDB_CSV("ClippingRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED, 1);
+        PRINT_TILEDB_CSV("MQRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED, 1);
+        PRINT_TILEDB_CSV("ReadPosRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED, 1);
+        PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_FIXED, 1);
+        PRINT_TILEDB_CSV("MQ",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED, 1);
+        PRINT_TILEDB_CSV("MQ0",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_FIXED, 1);
         //Print relevant FORMAT fields
-        PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing), 1);
-        PRINT_TILEDB_CSV("MIN_DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing), 1);
-        PRINT_TILEDB_CSV("GQ",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing), 1);
-        PRINT_TILEDB_CSV("SB",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing), 4);
-        //For newer versions, print #elements first
-        if(!is_old_tiledb_version)
-            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT,",%d",line->n_allele);
-        PRINT_TILEDB_CSV("AD",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing), line->n_allele);
+        PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_FIXED, 1);
+        PRINT_TILEDB_CSV("MIN_DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_FIXED, 1);
+        PRINT_TILEDB_CSV("GQ",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_FIXED, 1);
+        PRINT_TILEDB_CSV("SB",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_FIXED, 4);
+        PRINT_TILEDB_CSV("AD",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_R, line->n_allele);
         int num_gts =(line->n_allele*(line->n_allele+1))/2;
-        //For newer versions, print #elements first
-        if(!is_old_tiledb_version)
-            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT,",%d",num_gts);
-        PRINT_TILEDB_CSV("PL",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing), num_gts);
+        PRINT_TILEDB_CSV("PL",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_G, num_gts);
     }
     TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_VOID,"\n");
     //For binary output, print cell size at the correct spot
