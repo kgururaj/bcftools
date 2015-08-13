@@ -119,6 +119,8 @@ extern "C"
     char** m_field_names;
     char** m_contig_names;
     uint64_t* m_contig_lengths;
+    //Over-ride sample name, if NULL ignored
+    char* m_tiledb_override_sample_name;
     //Mappings
     //Value in ith position specifies global sample idx in SQLite DB for ith
     //sample in the query array
@@ -130,12 +132,12 @@ extern "C"
     sqlite3* db;
   }sqlite_mappings_struct;
 
-    typedef struct
-    {
-      int m_input_sample_idx;
-      int m_reader_idx;
-      int64_t m_global_sample_idx;
-    }global_samples_struct;
+  typedef struct
+  {
+    int m_input_sample_idx;
+    int m_reader_idx;
+    int64_t m_global_sample_idx;
+  }global_samples_struct;
 
   typedef struct
   {

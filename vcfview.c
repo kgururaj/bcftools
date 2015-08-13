@@ -321,6 +321,8 @@ void free_sqlite3_data(void* info_ptr)
         free(mapping_info->m_contig_names);
     if(mapping_info->m_contig_lengths)
         free(mapping_info->m_contig_lengths);
+    if(mapping_info->m_tiledb_override_sample_name)
+        free(mapping_info->m_tiledb_override_sample_name);
     memset(mapping_info, 0, sizeof(sqlite_mappings_struct));
 }
 
@@ -956,7 +958,13 @@ void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_i
     for(i=0;i<hdr->n[BCF_DT_ID];++i)
         ptr[i] = (char*)(bcf_hdr_int2id(hdr, BCF_DT_ID, i));
     //Query samples, contigs and fields
-    query_samples_idx(mapping_info, n_samples, (const char* const*)(hdr->samples));
+    if(mapping_info->m_tiledb_override_sample_name)
+    {
+        assert(n_samples == 1); //header should have one sample, if the sample name is overridden by a command line argument
+        query_samples_idx(mapping_info, 1, (const char* const*)(&(mapping_info->m_tiledb_override_sample_name)));
+    }
+    else
+        query_samples_idx(mapping_info, n_samples, (const char* const*)(hdr->samples));
     query_contigs_offset(mapping_info, n_contigs, (const char* const*)(mapping_info->m_contig_names), mapping_info->m_contig_lengths);
     query_fields_idx(mapping_info, n_fields, (const char* const*)(mapping_info->m_field_names));
     //Version dependent values
@@ -1226,6 +1234,7 @@ enum ArgsIdxEnum
   ARGS_IDX_QUERY_POSITIONS_FILE,
   ARGS_IDX_PROFILE_GVCF_INTERVALS,
   ARGS_IDX_TILEDB_OUTPUT_FORMAT,
+  ARGS_IDX_TILEDB_OVERRIDE_SAMPLE_NAME,
   ARGS_IDX_TAG
 };
 
@@ -1287,6 +1296,7 @@ int main_vcfview(int argc, char *argv[])
         {"query-positions-file",1,0,ARGS_IDX_QUERY_POSITIONS_FILE},
 	{"profile-gvcf-intervals",0,0,ARGS_IDX_PROFILE_GVCF_INTERVALS},
         {"tiledb-output-format",1,0,ARGS_IDX_TILEDB_OUTPUT_FORMAT},
+        {"tiledb-override-sample-name",1,0,ARGS_IDX_TILEDB_OVERRIDE_SAMPLE_NAME},
         {0,0,0,0}
     };
     char *tmp;
@@ -1426,6 +1436,9 @@ int main_vcfview(int argc, char *argv[])
 		break;
             case ARGS_IDX_TILEDB_OUTPUT_FORMAT:
                 args->m_mapping_info.m_tiledb_output_version = string_to_tiledb_output_version(optarg);
+                break;
+            case ARGS_IDX_TILEDB_OVERRIDE_SAMPLE_NAME:
+                args->m_mapping_info.m_tiledb_override_sample_name = strdup(optarg);
                 break;
             case '?': usage(args);
             default: error("Unknown argument: %s\n", optarg);
