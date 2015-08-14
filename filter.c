@@ -375,7 +375,7 @@ static void filters_set_info_int(filter_t *flt, bcf1_t *line, token_t *tok)
     }
     else
     {
-        int32_t value;
+        int32_t value = 0;
         if ( bcf_get_info_value(line,tok->hdr_id,tok->idx,&value) <= 0 )
             tok->nvalues = 0;
         else
@@ -395,7 +395,7 @@ static void filters_set_info_float(filter_t *flt, bcf1_t *line, token_t *tok)
     }
     else
     {
-        float value;
+        float value = 0;
         if ( bcf_get_info_value(line,tok->hdr_id,tok->idx,&value) <= 0 )
             tok->nvalues = 0;
         else

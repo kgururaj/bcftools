@@ -1014,7 +1014,7 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
     unsigned cell_size_offset = 0u;
     {
         int num_values = -1;
-#define PRINT_TILEDB_CSV(field_name, bcf_ht_type, get_function, type_t, format_specifier, vector_end_condition, missing_condition, length_descriptor, fixed_num_values) \
+#define PRINT_TILEDB_CSV_WITH_GT_FLAG(field_name, bcf_ht_type, get_function, type_t, format_specifier, vector_end_condition, missing_condition, length_descriptor, fixed_num_values, is_gt_field) \
         { \
             int num_elements = (*buffer_size)/sizeof(type_t); \
             num_values = get_function(out_hdr, line, field_name, (void**)buffer, &num_elements, bcf_ht_type); \
@@ -1034,21 +1034,28 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
             } \
             else \
             { \
-                /*For newer versions, for attributes with variable# elements, print #elements first*/ \
-                if(length_descriptor != BCF_VL_FIXED && !is_old_tiledb_version) \
+                /*If GT field is being printed or (for newer versions and for attributes with variable# elements) print #elements first*/ \
+                if(is_gt_field || (length_descriptor != BCF_VL_FIXED && !is_old_tiledb_version)) \
                     TILEDB_CSV_BPRINTF(csv_out_buffer,bcf_ht_type,",%d",num_values); \
                 int k = 0;  \
                 type_t* ptr = (type_t*)(*buffer);      \
                 for(k=0;k<num_values;++k)   \
                 {   \
                     type_t val = ptr[k];    \
+                    if(is_gt_field) \
+                        val = bcf_gt_allele((int)val); \
                     TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_VOID,","); \
                     if(missing_condition) \
-                        continue; \
+                        TILEDB_CSV_BPRINTF(csv_out_buffer,bcf_ht_type,0,g_CSV_MISSING_CHARACTER);  \
                     TILEDB_CSV_BPRINTF(csv_out_buffer,bcf_ht_type,format_specifier,val);  \
                 }   \
             } \
         }
+
+        //This macro does not have a is_gt_field flag, is_gt_field assumed to be false
+#define PRINT_TILEDB_CSV(field_name, bcf_ht_type, get_function, type_t, format_specifier, vector_end_condition, missing_condition, length_descriptor, fixed_num_values) \
+        PRINT_TILEDB_CSV_WITH_GT_FLAG(field_name, bcf_ht_type, get_function, type_t, format_specifier, vector_end_condition, missing_condition, length_descriptor, fixed_num_values, 0)
+
         //Print co-ordinates : sample id, location
         ASSERT(mapping_info->input_sample_idx_2_global_idx[input_sample_idx] >= 0);
 #ifdef ZERO_BASED_POSITION
@@ -1192,6 +1199,7 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
         PRINT_TILEDB_CSV("AD",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_R, line->n_allele);
         int num_gts =(line->n_allele*(line->n_allele+1))/2;
         PRINT_TILEDB_CSV("PL",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_G, num_gts);
+        PRINT_TILEDB_CSV_WITH_GT_FLAG("GT",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_P, 0, 1);
     }
     TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_VOID,"\n");
     //For binary output, print cell size at the correct spot
