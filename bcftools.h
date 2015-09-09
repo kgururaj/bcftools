@@ -186,12 +186,17 @@ extern "C"
   typedef struct
   {
     uint8_t m_skip_coordinates;
+    unsigned m_htslib_buffer_size;
     buffer_wrapper m_csv_out_buffer;
-    FILE* m_csv_out_fptr; //non-0 if output to file/stream
     gvcf_stat_struct m_profile_intervals; //non-0 if profiling info to be collected
     random_sampling_struct m_sampling_info;//non-0 if sampling needs to be done
+    int64_t m_tiledb_anchor_interval; //non-0 if we wish to insert anchor cells to prevent the left-sweep from scanning too many cells
+    //Used to determine number of anchors
+    uint8_t m_print_tiledb_anchor_cell;        //boolean to determine whether anchor cell is being printed
+    int64_t m_last_inserted_tiledb_position;
+    int64_t m_curr_tiledb_anchor_position;
     char* m_htslib_buffer;
-    unsigned m_htslib_buffer_size; 
+    FILE* m_csv_out_fptr; //non-0 if output to file/stream
   } csv_output_struct;
 
   void open_sqlite3_db(const char* sqlite_file, sqlite3** db);

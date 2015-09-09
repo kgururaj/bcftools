@@ -1010,6 +1010,7 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
     //old version
     uint8_t is_old_tiledb_version = (mapping_info->m_tiledb_output_version == TILEDB_OUTPUT_CSV_V0);
     uint8_t is_tiledb_binary_output = (mapping_info->m_tiledb_output_version == TILEDB_OUTPUT_BINARY_V1);
+    uint8_t is_anchor_cell = csv_output_info->m_print_tiledb_anchor_cell;
     unsigned offset_at_start = csv_out_buffer->m_offset;
     unsigned cell_size_offset = 0u;
     {
@@ -1017,7 +1018,8 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
 #define PRINT_TILEDB_CSV_WITH_GT_FLAG(field_name, bcf_ht_type, get_function, type_t, format_specifier, vector_end_condition, missing_condition, length_descriptor, fixed_num_values, is_gt_field) \
         { \
             int num_elements = (*buffer_size)/sizeof(type_t); \
-            num_values = get_function(out_hdr, line, field_name, (void**)buffer, &num_elements, bcf_ht_type); \
+            /*For anchor cells, print NULL only*/ \
+            num_values = is_anchor_cell ? -1 : get_function(out_hdr, line, field_name, (void**)buffer, &num_elements, bcf_ht_type); \
             if(num_elements*sizeof(type_t) > (*buffer_size)) \
                 (*buffer_size) = num_elements*sizeof(type_t); \
             if(num_values < 0) \
@@ -1063,6 +1065,9 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
 #else
         int64_t position = contig_offset + ((uint64_t)line->pos) + 1;
 #endif
+        //For anchor cells, the position is the anchor position
+        if(is_anchor_cell)
+            position = csv_output_info->m_curr_tiledb_anchor_position;
 	if(sampling_info)
 	{
 	    int random_value = rand();
@@ -1070,8 +1075,11 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
 		fprintf(sampling_info->m_spit_random_positions,"%"PRIi64"\n",position);
 	    return 0;
 	}
-	int64_t global_end_position = 0;
         //get END position
+	int64_t global_end_position = 0;
+        if(is_anchor_cell)
+            global_end_position = -1;   //why -1, essentially this tells TileDB that this is an invalid cell (anchor cell)
+        else
         {
             int num_elements = (*buffer_size)/sizeof(int);
             int num_values = bcf_get_info_values(out_hdr, line, "END", (void**)buffer, &num_elements, BCF_HT_INT);
@@ -1085,6 +1093,7 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
 #endif
 		global_end_position = contig_offset + ((int64_t)end_pos);
             }
+            csv_output_info->m_last_inserted_tiledb_position = global_end_position;
         }
 	if(profile_intervals)
 	{
@@ -1127,61 +1136,84 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
             //print END position
             TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT64,",%"PRIi64, global_end_position);
         }
-        //For binary, the size of the var:char field must be printed first 
-        //Print length of REF string 
-        if(is_tiledb_binary_output)
-            TILEDB_CSV_BPRINTF(csv_out_buffer, BCF_HT_INT,",%d", strlen(line->d.allele[0]));
-        //print reference allele
-        TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_STR,",%s", line->d.allele[0]);
-        //Position in buffer after REF
-        int after_ref_offset = csv_out_buffer->m_offset;
-        //Separator for ALT alleles
-        char alt_separator = ',';
-        if(is_old_tiledb_version)
+        //For anchor cells, print NULL for REF, ALT, QUAL, FILTER fields
+        if(is_anchor_cell)
         {
-            //For old versions, print #ALT alleles first
-            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT,",%d", line->n_allele-1);
-            alt_separator = ',';
-        }
-        else
-            alt_separator = '|';
-        //For binary, the size of the var:char field must be printed first 
-        //Just allocate space for now and update later once the length is known
-        if(is_tiledb_binary_output)
-        {
-            ALLOCATE_SPACE_IN_BUFFER(csv_out_buffer, sizeof(int));
-        }
-        int alt_start_offset = csv_out_buffer->m_offset;
-        //print alt alleles
-        TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_VOID,",");   //print comma before first ALT allele
-        int j = 0;
-        for(j=1;j<line->n_allele;++j)
-        {
-            if(j > 1)
-                TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_CHAR,"%c",alt_separator);
-            if(strcmp(line->d.allele[j],"<NON_REF>") == 0)
-                TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_STR,"%s",CSV_NON_REF_REPRESENTATION);
+            //REF
+            //For binary, the size of the var:char field is all that is needed 
+            if(is_tiledb_binary_output)
+                TILEDB_CSV_BPRINTF(csv_out_buffer, BCF_HT_INT,",%d", 0);
             else
-                TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_STR,"%s",line->d.allele[j]);
+                TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_STR,",%c", g_CSV_MISSING_CHARACTER);
+            //ALT
+            //For binary, the size of the var:char field is all that is needed 
+            if(is_tiledb_binary_output)
+                TILEDB_CSV_BPRINTF(csv_out_buffer, BCF_HT_INT,",%d", 0);
+            else
+                TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_STR,",%c", g_CSV_MISSING_CHARACTER);
+            //QUAL
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_REAL,0,g_CSV_MISSING_CHARACTER);
+            //Set #filters to 0
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT,",%d",0);
         }
-        //For binary output, print length of concatenated ALT string 
-        if(is_tiledb_binary_output)
-        {
-            int alt_length = csv_out_buffer->m_offset - alt_start_offset;
-            memcpy(csv_out_buffer->m_buffer+after_ref_offset, &alt_length, sizeof(int));
-        }
-        //print QUAL
-        if(bcf_float_is_missing(line->qual))
-            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_CHAR,0,g_CSV_MISSING_CHARACTER);
         else
-            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_REAL,",%0.3f",line->qual);
-        //print number of filters, followed by filter idx
-        TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT,",%d",line->d.n_flt);
-        for(j=0;j<line->d.n_flt;++j)
         {
-            ASSERT(line->d.flt[j] >= 0 && line->d.flt[j] < out_hdr->n[BCF_DT_ID]);
-            ASSERT(mapping_info->input_field_idx_2_global_idx[line->d.flt[j]] >= 0);
-            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT64,",%"PRIi64,mapping_info->input_field_idx_2_global_idx[line->d.flt[j]]);
+            //For binary, the size of the var:char field must be printed first 
+            //Print length of REF string 
+            if(is_tiledb_binary_output)
+                TILEDB_CSV_BPRINTF(csv_out_buffer, BCF_HT_INT,",%d", strlen(line->d.allele[0]));
+            //print reference allele
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_STR,",%s", line->d.allele[0]);
+            //Position in buffer after REF
+            int after_ref_offset = csv_out_buffer->m_offset;
+            //Separator for ALT alleles
+            char alt_separator = ',';
+            if(is_old_tiledb_version)
+            {
+                //For old versions, print #ALT alleles first
+                TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT,",%d", line->n_allele-1);
+                alt_separator = ',';
+            }
+            else
+                alt_separator = '|';
+            //For binary, the size of the var:char field must be printed first 
+            //Just allocate space for now and update later once the length is known
+            if(is_tiledb_binary_output)
+            {
+                ALLOCATE_SPACE_IN_BUFFER(csv_out_buffer, sizeof(int));
+            }
+            int alt_start_offset = csv_out_buffer->m_offset;
+            //print alt alleles
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_VOID,",");   //print comma before first ALT allele
+            int j = 0;
+            for(j=1;j<line->n_allele;++j)
+            {
+                if(j > 1)
+                    TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_CHAR,"%c",alt_separator);
+                if(strcmp(line->d.allele[j],"<NON_REF>") == 0)
+                    TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_STR,"%s",CSV_NON_REF_REPRESENTATION);
+                else
+                    TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_STR,"%s",line->d.allele[j]);
+            }
+            //For binary output, print length of concatenated ALT string 
+            if(is_tiledb_binary_output)
+            {
+                int alt_length = csv_out_buffer->m_offset - alt_start_offset;
+                memcpy(csv_out_buffer->m_buffer+after_ref_offset, &alt_length, sizeof(int));
+            }
+            //print QUAL
+            if(bcf_float_is_missing(line->qual))
+                TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_REAL,0,g_CSV_MISSING_CHARACTER);
+            else
+                TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_REAL,",%0.3f",line->qual);
+            //print number of filters, followed by filter idx
+            TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT,",%d",line->d.n_flt);
+            for(j=0;j<line->d.n_flt;++j)
+            {
+                ASSERT(line->d.flt[j] >= 0 && line->d.flt[j] < out_hdr->n[BCF_DT_ID]);
+                ASSERT(mapping_info->input_field_idx_2_global_idx[line->d.flt[j]] >= 0);
+                TILEDB_CSV_BPRINTF(csv_out_buffer,BCF_HT_INT64,",%"PRIi64,mapping_info->input_field_idx_2_global_idx[line->d.flt[j]]);
+            }
         }
         //Print relevant INFO fields
         PRINT_TILEDB_CSV("BaseQRankSum",BCF_HT_REAL, bcf_get_info_values, float,"%.2f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED,1);
@@ -1228,8 +1260,35 @@ void write_csv_for_one_VCF_line(sqlite_mappings_struct* mapping_info, csv_output
     if(SHOULD_DO_SAMPLING(csv_output_info->m_sampling_info) || SHOULD_DO_PROFILING(csv_output_info->m_profile_intervals))
 	write_csv_line(mapping_info, csv_output_info, out_hdr, line, 0);
     else
+    {
+        //Insert anchor cells if needed
+        if(csv_output_info->m_tiledb_anchor_interval)
+        {
+            int contig_id = line->rid;
+            ASSERT(mapping_info->input_contig_idx_2_global_idx[contig_id] >= 0);
+            int64_t contig_offset = mapping_info->input_contig_idx_2_offset[contig_id];
+#ifdef ZERO_BASED_POSITION
+            int64_t position = contig_offset + ((uint64_t)line->pos);
+#else
+            int64_t position = contig_offset + ((uint64_t)line->pos) + 1;
+#endif
+            int64_t curr_anchor_position = csv_output_info->m_last_inserted_tiledb_position + csv_output_info->m_tiledb_anchor_interval;
+            //Far off from last inserted position, insert anchor cells
+            if(position > curr_anchor_position + csv_output_info->m_tiledb_anchor_interval)
+            {
+                csv_output_info->m_print_tiledb_anchor_cell = 1;
+                for(;curr_anchor_position < position;curr_anchor_position+=csv_output_info->m_tiledb_anchor_interval)
+                {
+                    csv_output_info->m_curr_tiledb_anchor_position = curr_anchor_position;
+                    for(i=0;i<bcf_hdr_nsamples(out_hdr);++i)
+                        write_csv_line(mapping_info, csv_output_info, out_hdr, line, i);
+                }
+                csv_output_info->m_print_tiledb_anchor_cell = 0;
+            }
+        }
 	for(i=0;i<bcf_hdr_nsamples(out_hdr);++i)
 	    write_csv_line(mapping_info, csv_output_info, out_hdr, line, i);
+    }
 }
 
 enum ArgsIdxEnum
@@ -1243,6 +1302,7 @@ enum ArgsIdxEnum
   ARGS_IDX_PROFILE_GVCF_INTERVALS,
   ARGS_IDX_TILEDB_OUTPUT_FORMAT,
   ARGS_IDX_TILEDB_OVERRIDE_SAMPLE_NAME,
+  ARGS_IDX_TILEDB_ANCHOR_INTERVAL,
   ARGS_IDX_TAG
 };
 
@@ -1305,6 +1365,7 @@ int main_vcfview(int argc, char *argv[])
 	{"profile-gvcf-intervals",0,0,ARGS_IDX_PROFILE_GVCF_INTERVALS},
         {"tiledb-output-format",1,0,ARGS_IDX_TILEDB_OUTPUT_FORMAT},
         {"tiledb-override-sample-name",1,0,ARGS_IDX_TILEDB_OVERRIDE_SAMPLE_NAME},
+        {"tiledb-anchor-interval",1,0,ARGS_IDX_TILEDB_ANCHOR_INTERVAL},
         {0,0,0,0}
     };
     char *tmp;
@@ -1447,6 +1508,9 @@ int main_vcfview(int argc, char *argv[])
                 break;
             case ARGS_IDX_TILEDB_OVERRIDE_SAMPLE_NAME:
                 args->m_mapping_info.m_tiledb_override_sample_name = strdup(optarg);
+                break;
+            case ARGS_IDX_TILEDB_ANCHOR_INTERVAL:
+                args->m_csv_output_info.m_tiledb_anchor_interval = strtoull(optarg, 0, 10);
                 break;
             case '?': usage(args);
             default: error("Unknown argument: %s\n", optarg);
