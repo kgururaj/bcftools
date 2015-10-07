@@ -315,12 +315,33 @@ void free_sqlite3_data(void* info_ptr)
 	free(mapping_info->input_contig_idx_2_offset);
     if(mapping_info->db)
 	sqlite3_close(mapping_info->db);
+    int64_t i = 0;
     if(mapping_info->m_field_names)
+    {
+        if(mapping_info->m_field_name_strings_allocated)
+            for(i=0;i<mapping_info->m_num_fields;++i)
+                if(mapping_info->m_field_names[i])
+                    free(mapping_info->m_field_names[i]);
         free(mapping_info->m_field_names);
+    }
     if(mapping_info->m_contig_names)
+    {
+        if(mapping_info->m_contig_name_strings_allocated)
+            for(i=0;i<mapping_info->m_num_contigs;++i)
+                if(mapping_info->m_contig_names[i])
+                    free(mapping_info->m_contig_names[i]);
         free(mapping_info->m_contig_names);
+    }
     if(mapping_info->m_contig_lengths)
         free(mapping_info->m_contig_lengths);
+    if(mapping_info->m_sample_names)
+    {
+        if(mapping_info->m_sample_name_strings_allocated)
+            for(i=0;i<mapping_info->m_num_samples;++i)
+                if(mapping_info->m_sample_names[i])
+                    free(mapping_info->m_sample_names[i]);
+        free(mapping_info->m_sample_names);
+    }
     if(mapping_info->m_tiledb_override_sample_name)
         free(mapping_info->m_tiledb_override_sample_name);
     memset(mapping_info, 0, sizeof(sqlite_mappings_struct));
@@ -849,7 +870,7 @@ const int64_t* query_samples_idx(void* info_ptr, int n_samples, const char* cons
     return mapping_info->input_sample_idx_2_global_idx;
 }
 
-const int64_t* query_contigs_offset(void* info_ptr, int n_contigs, const char* const* contig_names, const uint64_t* contig_lengths)
+const int64_t* query_contigs_offset(void* info_ptr, int n_contigs, const char* const* contig_names, const int64_t* contig_lengths)
 {
     COMMON_QUERY_VARIABLE_DECLARATION; 
     //max contig offset
@@ -943,7 +964,11 @@ void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_i
     //Allocate arrays to store field and contig names
     mapping_info->m_field_names = (char**)malloc(n_fields*sizeof(char*));
     mapping_info->m_contig_names = (char**)malloc(n_contigs*sizeof(char*));
-    mapping_info->m_contig_lengths = (uint64_t*)malloc(n_contigs*sizeof(uint64_t));
+    mapping_info->m_contig_lengths = (int64_t*)malloc(n_contigs*sizeof(uint64_t));
+    //Initialize length variables
+    mapping_info->m_num_samples = n_samples;
+    mapping_info->m_num_fields = n_fields;
+    mapping_info->m_num_contigs = n_contigs;
 
     int i = 0;
     //Contigs
@@ -988,7 +1013,133 @@ void initialize_samples_contigs_and_fields_idx(sqlite_mappings_struct* mapping_i
     }
 }
 
+int sqlite_count_handler(void* ptr, int num_columns, char** field_values, char** column_names)
+{
+  assert(num_columns == 1);
+  //Ptr to count variable
+  int64_t* count_ptr = (int64_t*)ptr;
+  *count_ptr = strtoll(field_values[0], 0, 10);
+  return 0;
+}
 
+int sqlite_scan_samples_handler(void* ptr, int num_columns, char** field_values, char** column_names)
+{
+  assert(num_columns == 2);
+  sqlite_mappings_struct* info = (sqlite_mappings_struct*)ptr;
+  int64_t sample_idx = strtoll(field_values[0], 0, 10);
+#ifdef ZERO_BASED_SAMPLE_IDS
+  //SQLite idxs are 1 based, but zero based in TileDB
+  --sample_idx;
+#endif
+  assert(sample_idx < info->m_num_samples);
+  info->m_sample_names[sample_idx] = strdup(field_values[1]);
+  return 0;
+}
+
+void read_all_samples_from_sqlite(sqlite_mappings_struct* mapping_info)
+{
+    char* error_msg = 0;
+    //Find #samples in SQLite
+    const char* query_string = "select count(*) from sample_names";
+    sqlite3_exec(mapping_info->db, query_string, sqlite_count_handler, &(mapping_info->m_num_samples), &error_msg);
+#ifndef ZERO_BASED_SAMPLE_IDS
+    //SQLite idxs are 1 based, so increase size of array if NOT 0-based
+    ++(mapping_info->m_num_samples);
+#endif
+    //allocate array
+    mapping_info->m_sample_names = (char**)calloc(mapping_info->m_num_samples, sizeof(char*));
+    //scan table
+    const char* scan_query_string = "select sample_idx,sample_name from sample_names";
+    sqlite3_exec(mapping_info->db, scan_query_string, sqlite_scan_samples_handler, mapping_info, &error_msg);
+    //flag that all strings are allocated and must be freed later
+    mapping_info->m_sample_name_strings_allocated = 1;
+}
+
+int sqlite_scan_fields_handler(void* ptr, int num_columns, char** field_values, char** column_names)
+{
+  assert(num_columns == 2);
+  sqlite_mappings_struct* info = (sqlite_mappings_struct*)ptr;
+  int64_t field_idx = strtoll(field_values[0], 0, 10);
+  assert(field_idx < info->m_num_fields);
+  info->m_field_names[field_idx] = strdup(field_values[1]);
+  return 0;
+}
+
+void read_all_fields_from_sqlite(sqlite_mappings_struct* mapping_info)
+{
+    char* error_msg = 0;
+    //Find #fields in SQLite
+    const char* query_string = "select count(*) from field_names";
+    sqlite3_exec(mapping_info->db, query_string, sqlite_count_handler, &(mapping_info->m_num_fields), &error_msg);
+    //SQLite idxs are 1 based, so increase size of array
+    ++(mapping_info->m_num_fields);
+    //allocate array
+    mapping_info->m_field_names = (char**)calloc(mapping_info->m_num_fields, sizeof(char*));
+    //scan table
+    const char* scan_query_string = "select field_idx,field_name from field_names";
+    sqlite3_exec(mapping_info->db, scan_query_string, sqlite_scan_fields_handler, mapping_info, &error_msg);
+    //flag that all strings are allocated and must be freed later
+    mapping_info->m_field_name_strings_allocated = 1;
+}
+
+int sqlite_scan_contigs_handler(void* ptr, int num_columns, char** field_values, char** column_names)
+{
+  assert(num_columns == 4);
+  sqlite_mappings_struct* info = (sqlite_mappings_struct*)ptr;
+  int64_t contig_idx = strtoll(field_values[0], 0, 10);
+  assert(contig_idx < info->m_num_contigs);
+  info->m_contig_names[contig_idx] = strdup(field_values[1]);
+  info->input_contig_idx_2_offset[contig_idx] = strtoll(field_values[2], 0, 10);
+  info->m_contig_lengths[contig_idx] = strtoll(field_values[3], 0, 10);
+  return 0;
+}
+
+void read_all_contigs_from_sqlite(sqlite_mappings_struct* mapping_info)
+{
+    char* error_msg = 0;
+    //Find #contigs in SQLite
+    const char* query_string = "select count(*) from contig_names";
+    sqlite3_exec(mapping_info->db, query_string, sqlite_count_handler, &(mapping_info->m_num_contigs), &error_msg);
+    //SQLite idxs are 1 based, so increase size of array
+    ++(mapping_info->m_num_contigs);
+    //allocate arrays
+    mapping_info->m_contig_names = (char**)calloc(mapping_info->m_num_contigs, sizeof(char*));
+    mapping_info->m_contig_lengths = (int64_t*)calloc(mapping_info->m_num_contigs, sizeof(int64_t));
+    //initialize to -1, invalid
+    memset(mapping_info->m_contig_lengths, -1, mapping_info->m_num_contigs*sizeof(int64_t));
+    mapping_info->input_contig_idx_2_offset = (int64_t*)calloc(mapping_info->m_num_contigs, sizeof(int64_t));
+    //initialize to -1, invalid
+    memset(mapping_info->input_contig_idx_2_offset, -1, mapping_info->m_num_contigs*sizeof(int64_t));
+    //scan table
+    const char* scan_query_string = "select contig_idx,contig_name,contig_offset,contig_length from contig_names";
+    sqlite3_exec(mapping_info->db, scan_query_string, sqlite_scan_contigs_handler, mapping_info, &error_msg);
+    //flag that all strings are allocated and must be freed later
+    mapping_info->m_contig_name_strings_allocated = 1;
+}
+
+//Reads all tables from SQLite into memory
+void read_all_from_sqlite(sqlite_mappings_struct* mapping_info)
+{
+    read_all_samples_from_sqlite(mapping_info);
+    read_all_fields_from_sqlite(mapping_info);
+    read_all_contigs_from_sqlite(mapping_info); 
+}
+
+void test_read_all(const char* sqlite_file)
+{
+    sqlite_mappings_struct* info = (sqlite_mappings_struct*)allocate_sqlite3_mapping(sqlite_file);
+    read_all_from_sqlite(info);
+    int64_t i = 0;
+    for(i=0;i<info->m_num_samples;++i)
+        printf("Idx %"PRIi64" sample name %s\n", i, info->m_sample_names[i]);
+    for(i=0;i<info->m_num_fields;++i)
+        printf("Idx %"PRIi64" field name %s\n", i, info->m_field_names[i]);
+    for(i=0;i<info->m_num_contigs;++i)
+        printf("Idx %"PRIi64" contig name %s offset %"PRIi64" length %"PRIi64"\n", i, info->m_contig_names[i],
+                info->input_contig_idx_2_offset[i], info->m_contig_lengths[i]);
+    free_sqlite3_data(info);
+    free(info);
+}
 
 int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_output_info,
 	bcf_hdr_t* out_hdr, bcf1_t* line, int input_sample_idx)
@@ -1665,3 +1816,4 @@ int main_vcfview(int argc, char *argv[])
     free(args);
     return 0;
 }
+

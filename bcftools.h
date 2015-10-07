@@ -115,10 +115,19 @@ extern "C"
     unsigned m_tiledb_output_version;
     //Pointer to printer function
     TileDBPrinterTy m_tiledb_printer;
+    //Number of elements
+    int64_t m_num_fields;
+    int64_t m_num_samples;
+    int64_t m_num_contigs;
     //List of field names
     char** m_field_names;
+    char** m_sample_names;
     char** m_contig_names;
-    uint64_t* m_contig_lengths;
+    //Flags to indicate whether strings corresponding to names are allocated or simply point to strings allocated elsewhere
+    uint8_t m_field_name_strings_allocated;
+    uint8_t m_sample_name_strings_allocated;
+    uint8_t m_contig_name_strings_allocated;
+    int64_t* m_contig_lengths;
     //Over-ride sample name, if NULL ignored
     char* m_tiledb_override_sample_name;
     //Mappings
@@ -236,8 +245,13 @@ extern "C"
    * @return Pointer to array containing result of query. This pointer is managed by the bcftools code. Do not free etc
    * */
   const int64_t* query_samples_idx(void* info_ptr, int n_samples, const char* const* sample_names);
-  const int64_t* query_contigs_offset(void* info_ptr, int n_contigs, const char* const* contig_names, const uint64_t* contig_lengths);
+  const int64_t* query_contigs_offset(void* info_ptr, int n_contigs, const char* const* contig_names, const int64_t* contig_lengths);
   const int64_t* query_fields_idx(void* info_ptr, int n_fields, const char* const* field_names);
+  /*
+   * Read whole SQLite DB into memory
+   */
+  void read_all_from_sqlite(sqlite_mappings_struct* mapping_info);
+  void test_read_all(const char* sqlite_file);
   /*
    * Free members of sqlite_mappings_struct info_ptr
    */
