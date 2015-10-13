@@ -275,11 +275,12 @@ extern "C"
     char* m_reference_last_seq_read;
     int m_reference_last_read_pos;
     int m_reference_num_bases_read;
+    int m_reference_buffer_capacity;
     char* m_reference_buffer;
   } reference_genome_info;
   /*info for accessing a reference genome*/
-  void initialize_reference(reference_genome_info* info, const char* reference_filename);
-  void destroy_reference(reference_genome_info* info);
+  void initialize_reference_info(reference_genome_info* info, const char* reference_filename);
+  void free_reference_info(reference_genome_info* info);
   char get_reference_base_at_position(reference_genome_info* info, const char* seq_name, int pos);
 
   static inline double phred_score(double prob)

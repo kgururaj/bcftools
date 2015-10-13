@@ -2575,6 +2575,7 @@ char get_reference_base_at_position(reference_genome_info* info, const char* seq
 {
     int length = 0;
     ASSERT(seq_name);
+    ASSERT(info->m_reference_buffer);
     //See if pos is within the last buffer read
     if(strcmp(info->m_reference_last_seq_read, seq_name) == 0 && info->m_reference_last_read_pos <= pos)
     {
@@ -2582,10 +2583,7 @@ char get_reference_base_at_position(reference_genome_info* info, const char* seq
         if(offset < info->m_reference_num_bases_read)
             return info->m_reference_buffer[offset];
     }
-    if(info->m_reference_buffer)
-        free(info->m_reference_buffer);
-    //32KB read
-    info->m_reference_buffer = faidx_fetch_seq(info->m_reference_faidx, seq_name, pos, pos+32768, &length);
+    faidx_fetch_seq_into_buffer(info->m_reference_faidx, seq_name, pos, pos+info->m_reference_buffer_capacity, info->m_reference_buffer, &length);
     ASSERT(length > 0 && info->m_reference_buffer);
     strcpy(info->m_reference_last_seq_read, seq_name);
     info->m_reference_last_read_pos = pos;
@@ -3724,7 +3722,7 @@ void merge_vcf(args_t *args)
     if ( args->vcmp ) vcmp_destroy(args->vcmp);
 }
 
-void initialize_reference(reference_genome_info* info, const char* reference_filename)
+void initialize_reference_info(reference_genome_info* info, const char* reference_filename)
 {
     info->m_reference_filename = strdup(reference_filename);
     assert(info->m_reference_filename && "char* storing reference file name in args is NULL");
@@ -3735,9 +3733,12 @@ void initialize_reference(reference_genome_info* info, const char* reference_fil
     info->m_reference_faidx = fai_load(info->m_reference_filename);
     assert(info->m_reference_faidx);
     info->m_reference_last_seq_read = (char*)calloc(4096, sizeof(char));
+    //buffer
+    info->m_reference_buffer_capacity = 32768; //32KB
+    info->m_reference_buffer = (char*)malloc((info->m_reference_buffer_capacity+8)*sizeof(char));       //for null etc
 }
 
-void destroy_reference(reference_genome_info* info)
+void free_reference_info(reference_genome_info* info)
 {
     if(info->m_reference_filename)
     {
@@ -4006,7 +4007,7 @@ int main_vcfmerge(int argc, char *argv[])
 	    case  2 : args->header_only = 1; break;
 	    case  3 : args->force_samples = 1; break;
 	    case ARGS_IDX_MERGE_CONFIG_FILE: parse_merge_config(optarg); break;
-	    case ARGS_IDX_REFERENCE_FILE: initialize_reference(&(args->m_reference_info), optarg); break;
+	    case ARGS_IDX_REFERENCE_FILE: initialize_reference_info(&(args->m_reference_info), optarg); break;
 	    case ARGS_IDX_INPUT_GVCFS: g_is_input_gvcf = 1; break;
 	    case ARGS_IDX_TAG:  args->m_tag = strdup(optarg); break;
 	    case ARGS_IDX_DO_GATK_MERGE: g_do_gatk_merge = 1; break;
@@ -4067,7 +4068,7 @@ int main_vcfmerge(int argc, char *argv[])
     }
     bcf_sr_destroy(args->files);
     destroy_merge_config();
-    destroy_reference(&(args->m_reference_info));
+    free_reference_info(&(args->m_reference_info));
 #ifdef COLLECT_STATS
     print_stats(args);
     destroy_stats(args);
