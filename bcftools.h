@@ -27,6 +27,8 @@ THE SOFTWARE.  */
 
 #include <stdarg.h>
 #include <htslib/vcf.h>
+/*For gVCFs reference is needed to get base pair at interval split locations*/
+#include <htslib/faidx.h>
 #include <math.h>
 
 #define FT_GZ 1
@@ -264,6 +266,21 @@ extern "C"
   //Write CSV lines for all samples in a given line in the VCF
   void write_csv_for_one_VCF_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_output_info,
       bcf_hdr_t* out_hdr, bcf1_t* line);
+  //Struct for accessing reference genome
+  //reference genome access - required for gVCF merge
+  typedef struct
+  {
+    char* m_reference_filename;
+    faidx_t* m_reference_faidx;
+    char* m_reference_last_seq_read;
+    int m_reference_last_read_pos;
+    int m_reference_num_bases_read;
+    char* m_reference_buffer;
+  } reference_genome_info;
+  /*info for accessing a reference genome*/
+  void initialize_reference(reference_genome_info* info, const char* reference_filename);
+  void destroy_reference(reference_genome_info* info);
+  char get_reference_base_at_position(reference_genome_info* info, const char* seq_name, int pos);
 
   static inline double phred_score(double prob)
   {

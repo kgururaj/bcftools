@@ -34,8 +34,6 @@ THE SOFTWARE.  */
 #include <ctype.h>
 #include "bcftools.h"
 #include "vcmp.h"
-/*For gVCFs reference is needed to get base pair at interval split locations*/
-#include <htslib/faidx.h>
 
 #include <htslib/khash.h>
 KHASH_MAP_INIT_STR(strdict, int)
@@ -194,13 +192,7 @@ typedef struct
     bcf1_t *out_line;
     htsFile *out_fh;
     bcf_hdr_t *out_hdr;
-    //reference genome access - required for gVCF merge
-    char* reference_filename;
-    faidx_t* reference_faidx;
-    char* reference_last_seq_read;
-    int reference_last_read_pos;
-    int reference_num_bases_read;
-    char* reference_buffer;
+    reference_genome_info m_reference_info;
     char* m_tag;
 #ifdef COLLECT_STATS
     stat_struct stat_array[LAST_STAT_IDX];
@@ -2579,25 +2571,26 @@ void preprocess_line(args_t* args, bcf_sr_t* reader, bcf1_t* line, int file_idx)
     line->m_is_preprocessed = 1;
 }
 
-char get_reference_base_at_position(args_t* args, const char* seq_name, int pos)
+char get_reference_base_at_position(reference_genome_info* info, const char* seq_name, int pos)
 {
     int length = 0;
     ASSERT(seq_name);
     //See if pos is within the last buffer read
-    if(strcmp(args->reference_last_seq_read, seq_name) == 0 && args->reference_last_read_pos <= pos)
+    if(strcmp(info->m_reference_last_seq_read, seq_name) == 0 && info->m_reference_last_read_pos <= pos)
     {
-        int offset = (pos -  args->reference_last_read_pos);
-        if(offset < args->reference_num_bases_read)
-            return args->reference_buffer[offset];
+        int offset = (pos -  info->m_reference_last_read_pos);
+        if(offset < info->m_reference_num_bases_read)
+            return info->m_reference_buffer[offset];
     }
-    if(args->reference_buffer)
-        free(args->reference_buffer);
-    args->reference_buffer = faidx_fetch_seq(args->reference_faidx, seq_name, pos, pos+4096, &length);
-    ASSERT(length > 0 && args->reference_buffer);
-    strcpy(args->reference_last_seq_read, seq_name);
-    args->reference_last_read_pos = pos;
-    args->reference_num_bases_read = length;
-    return args->reference_buffer[0];
+    if(info->m_reference_buffer)
+        free(info->m_reference_buffer);
+    //32KB read
+    info->m_reference_buffer = faidx_fetch_seq(info->m_reference_faidx, seq_name, pos, pos+32768, &length);
+    ASSERT(length > 0 && info->m_reference_buffer);
+    strcpy(info->m_reference_last_seq_read, seq_name);
+    info->m_reference_last_read_pos = pos;
+    info->m_reference_num_bases_read = length;
+    return info->m_reference_buffer[0];
 }
 
 //Say we are merging 3 samples S1, S2, S3
@@ -2705,7 +2698,7 @@ int find_end_position(args_t* args, int* chrom_idx, char** ref_id, char* ref_bas
 #endif
             //First base of reference allele - REF, obtain from reference file
             const char* contig_name = reader->processed_header->id[BCF_DT_CTG][rid].key;
-            (*ref_base) = get_reference_base_at_position(args, contig_name, end_point+1);
+            (*ref_base) = get_reference_base_at_position(&(args->m_reference_info), contig_name, end_point+1);
         }
     }
     return end_point;
@@ -3731,28 +3724,28 @@ void merge_vcf(args_t *args)
     if ( args->vcmp ) vcmp_destroy(args->vcmp);
 }
 
-void initialize_reference(args_t* args, const char* reference_filename)
+void initialize_reference(reference_genome_info* info, const char* reference_filename)
 {
-    args->reference_filename = strdup(reference_filename);
-    assert(args->reference_filename && "char* storing reference file name in args is NULL");
-    /*args->reference_fp = gzopen(argv[1], "r");*/
-    /*assert(args->reference_fp != Z_NULL && "Failed to open reference file");*/
-    /*args->reference_seq = kseq_init(args->reference_fp);*/
-    /*assert(args->reference_seq && "Unable to allocate memory for reference seq");*/
-    args->reference_faidx = fai_load(args->reference_filename);
-    assert(args->reference_faidx);
-    args->reference_last_seq_read = (char*)calloc(4096, sizeof(char));
+    info->m_reference_filename = strdup(reference_filename);
+    assert(info->m_reference_filename && "char* storing reference file name in args is NULL");
+    /*info->m_reference_fp = gzopen(argv[1], "r");*/
+    /*assert(info->m_reference_fp != Z_NULL && "Failed to open reference file");*/
+    /*info->m_reference_seq = kseq_init(info->m_reference_fp);*/
+    /*assert(info->m_reference_seq && "Unable to allocate memory for reference seq");*/
+    info->m_reference_faidx = fai_load(info->m_reference_filename);
+    assert(info->m_reference_faidx);
+    info->m_reference_last_seq_read = (char*)calloc(4096, sizeof(char));
 }
 
-void destroy_reference(args_t* args)
+void destroy_reference(reference_genome_info* info)
 {
-    if(args->reference_filename)
+    if(info->m_reference_filename)
     {
-        fai_destroy(args->reference_faidx);
-        free(args->reference_filename);
-        free(args->reference_last_seq_read);
-        if(args->reference_buffer)
-            free(args->reference_buffer);
+        fai_destroy(info->m_reference_faidx);
+        free(info->m_reference_filename);
+        free(info->m_reference_last_seq_read);
+        if(info->m_reference_buffer)
+            free(info->m_reference_buffer);
     }
 }
 
@@ -4013,7 +4006,7 @@ int main_vcfmerge(int argc, char *argv[])
 	    case  2 : args->header_only = 1; break;
 	    case  3 : args->force_samples = 1; break;
 	    case ARGS_IDX_MERGE_CONFIG_FILE: parse_merge_config(optarg); break;
-	    case ARGS_IDX_REFERENCE_FILE: initialize_reference(args, optarg); break;
+	    case ARGS_IDX_REFERENCE_FILE: initialize_reference(&(args->m_reference_info), optarg); break;
 	    case ARGS_IDX_INPUT_GVCFS: g_is_input_gvcf = 1; break;
 	    case ARGS_IDX_TAG:  args->m_tag = strdup(optarg); break;
 	    case ARGS_IDX_DO_GATK_MERGE: g_do_gatk_merge = 1; break;
@@ -4036,7 +4029,7 @@ int main_vcfmerge(int argc, char *argv[])
     if ( argc==optind && !args->file_list ) usage();
     if ( argc-optind<2 && !args->file_list ) usage();
 
-    assert((!g_is_input_gvcf || args->reference_filename) && "To merge gVCFs, you must provide a reference file using --reference=<filename.fa");
+    assert((!g_is_input_gvcf || args->m_reference_info.m_reference_filename) && "To merge gVCFs, you must provide a reference file using --reference=<filename.fa");
     assert((!g_do_tiledb_merge || args->m_tiledb_info.m_output_directory) && "To produce a sorted CSV file for TileDB, you must provide a directory to store csv files using --tiledb-output-dir=<dir>");
     assert((!g_do_tiledb_merge || args->m_tiledb_info.m_sqlite_file) && "To produce a sorted CSV file for TileDB, you must provide the path to the samples,contigs and fields sqlite file using --sqlite=<path_to_sqlite_file>");
 
@@ -4074,7 +4067,7 @@ int main_vcfmerge(int argc, char *argv[])
     }
     bcf_sr_destroy(args->files);
     destroy_merge_config();
-    destroy_reference(args);
+    destroy_reference(&(args->m_reference_info));
 #ifdef COLLECT_STATS
     print_stats(args);
     destroy_stats(args);
