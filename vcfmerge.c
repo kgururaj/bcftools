@@ -2061,9 +2061,12 @@ void merge_format(args_t *args, bcf1_t *out)
                 continue;
             const char *key = hdr->id[BCF_DT_ID][fmt->id].key;
 #ifdef USE_ID_MAP
+#if 0
+            //in GATK-3.5, GQ is kept
             //For lines with variants other than NON_REF, GQ format field is dropped
             if(g_do_gatk_merge && !(args->m_idmap.m_merged_has_only_non_ref) && fmt->id == curr_map->m_GQ_id)
                 continue;
+#endif
             ASSERT(fmt->id < curr_map->m_num_ids);
             int out_id = curr_map->m_id_2_merged_id[fmt->id];
             ASSERT(out_id >= 0 && out_id < out_hdr->n[BCF_DT_ID] && out_id < args->m_idmap.m_num_merged_ids);
