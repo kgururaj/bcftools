@@ -12,13 +12,14 @@
 #define ASSERT(X)  ;
 #endif
 
-#define FLOAT_TOLERANCE 1e-2f
+float g_FLOAT_TOLERANCE=1e-5f;
 
 int g_printed_already = 0;
 extern kstring_t g_debug_string;
 int g_num_files = 0;
 int g_skip_DP_info = 0;
 int g_skip_AD_fmt = 0;
+int g_skip_GT = 0;
 typedef struct
 {
     char* m_name;
@@ -214,10 +215,10 @@ int compare_unequal_float(float a, float b)
     if(a != 0)
     {
         float rel_diff = fabsf(abs_diff/a);
-        return (abs_diff > FLOAT_TOLERANCE && rel_diff > FLOAT_TOLERANCE);
+        return (abs_diff > g_FLOAT_TOLERANCE && rel_diff > g_FLOAT_TOLERANCE);
     }
     else
-        return (abs_diff > FLOAT_TOLERANCE);
+        return (abs_diff > g_FLOAT_TOLERANCE);
 }
 
 char* g_diff_string = 0;
@@ -466,9 +467,7 @@ void compare_fmt(reader* first_file, reader* second_file, int first_idx, int sec
         for(j=0;j<second_line->n_fmt;++j)
         {
             bcf_fmt_t* second_fmt = &(second_line->d.fmt[j]);
-            //FIXME: ignore GT 
-            //GT because gatk CombineGVCFS simply outputs no genotypes
-            if(second_fmt->p == 0 || second_fmt->id == g_readers_map[second_idx].m_GT_fmt_id
+            if(second_fmt->p == 0 || (g_skip_GT && second_fmt->id == g_readers_map[second_idx].m_GT_fmt_id)
 		|| (g_skip_AD_fmt && second_fmt->id == g_readers_map[second_idx].m_AD_fmt_id) )
                 continue;
             second_element_size = get_element_size(bcf_hdr_id2type(second_file->m_hdr, BCF_HL_FMT, second_fmt->id));
@@ -575,7 +574,8 @@ void compare_filters(reader* first_file, reader* second_file, int first_idx, int
 enum ArgsIdxEnum
 {
   ARGS_IDX_SKIP_DP_INFO=1000,
-  ARGS_IDX_SKIP_AD_FMT
+  ARGS_IDX_SKIP_AD_FMT,
+  ARGS_IDX_SKIP_GT
 };
 
 int main_vcfdiff(int argc, char *argv[])
@@ -585,17 +585,25 @@ int main_vcfdiff(int argc, char *argv[])
     {
         {"skip-DP-info",0,0,ARGS_IDX_SKIP_DP_INFO},
         {"skip-AD-fmt",0,0,ARGS_IDX_SKIP_AD_FMT},
+        {"skip-GT",0,0,ARGS_IDX_SKIP_GT},
+        {"tolerance",0,0,'t'},
         {0,0,0,0}
     };
-    while ((c = getopt_long(argc, argv, "",loptions,NULL)) >= 0) {
+    while ((c = getopt_long(argc, argv, "t:",loptions,NULL)) >= 0) {
 	switch(c)
 	{
+            case 't':
+                g_FLOAT_TOLERANCE = strtof(optarg, 0);
+                break;
 	    case ARGS_IDX_SKIP_DP_INFO:
 		g_skip_DP_info = 1;
 		break;
 	    case ARGS_IDX_SKIP_AD_FMT:
 		g_skip_AD_fmt = 1;
 		break;
+            case ARGS_IDX_SKIP_GT:
+                g_skip_GT = 1;
+                break;
 	    default:
 		fprintf(stderr,"Unknown option\n");
 		exit(-1);
