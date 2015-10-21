@@ -1367,12 +1367,12 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
             }
         }
         //Print relevant INFO fields
-        PRINT_TILEDB_CSV("BaseQRankSum",BCF_HT_REAL, bcf_get_info_values, float,"%.2f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED,1);
-        PRINT_TILEDB_CSV("ClippingRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED, 1);
-        PRINT_TILEDB_CSV("MQRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED, 1);
-        PRINT_TILEDB_CSV("ReadPosRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED, 1);
+        PRINT_TILEDB_CSV("BaseQRankSum",BCF_HT_REAL, bcf_get_info_values, float,"%f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED,1);
+        PRINT_TILEDB_CSV("ClippingRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED, 1);
+        PRINT_TILEDB_CSV("MQRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED, 1);
+        PRINT_TILEDB_CSV("ReadPosRankSum",BCF_HT_REAL, bcf_get_info_values,float,"%f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED, 1);
         PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_FIXED, 1);
-        PRINT_TILEDB_CSV("MQ",BCF_HT_REAL, bcf_get_info_values,float,"%.2f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED, 1);
+        PRINT_TILEDB_CSV("MQ",BCF_HT_REAL, bcf_get_info_values,float,"%f",0,(bcf_float_is_missing(val)),BCF_VL_FIXED, 1);
         PRINT_TILEDB_CSV("MQ0",BCF_HT_INT, bcf_get_info_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_FIXED, 1);
         //Print relevant FORMAT fields
         PRINT_TILEDB_CSV("DP",BCF_HT_INT, bcf_get_format_values,int32_t,"%d",0,(val == bcf_int32_missing),BCF_VL_FIXED, 1);
