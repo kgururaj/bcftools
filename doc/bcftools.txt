@@ -190,12 +190,33 @@ specific commands to see if they apply.
     Comma-separated list of samples to include or exclude if prefixed
     with "&#94;".
 
-*-S, --samples-file* [&#94;]'FILE'::
+*-S, --samples-file* [&#94;]'FILE'[[samples_file]]::
     File of sample names to include or exclude if prefixed with "&#94;".
     One sample per line.
     The command *<<call,bcftools call>>* accepts an optional second
-    column indicating ploidy (0, 1 or 2) and can parse also PED files.
-    With *<<call,bcftools call>> -C* 'trio', PED file is expected.
+    column indicating ploidy (0, 1 or 2) or sex (as defined by
+    *<<ploidy,--ploidy>>*, for example "F" or "M"), and can parse also PED
+    files. If the second column is not present,
+    the sex "F" is assumed.
+    With *<<call,bcftools call>> -C* 'trio', PED file is expected. File
+    formats examples:
+----
+    sample1    1
+    sample2    2
+    sample3    2
+
+  or
+
+    sample1    M
+    sample2    F
+    sample3    F
+
+  or a .ped file (here is shown a minimum working example, the first column is 
+  ignored and the last indicates sex: 1=male, 2=female)
+
+    ignored daughterA fatherA motherA 2
+    ignored sonB fatherB motherB 1
+----
 
 *-t, --targets* \[&#94;]'chr'|'chr:pos'|'chr:from-to'|'chr:from-'[,...]::
     Similar as *-r, --regions*, but the next position is accessed by streaming the
@@ -372,6 +393,28 @@ demand. The original calling model can be invoked with the *-c* option.
 
 *-O, --output-type* 'b'|'u'|'z'|'v'::
     see *<<common_options,Common Options>>*
+
+*--ploidy* 'ASSEMBLY'['?'][[ploidy]]::
+    predefined ploidy, use 'list' (or any other unused word) to print a list
+    of all predefined assemblies. Append a question mark to print the actual
+    definition. See also *--ploidy-file*.
+
+*--ploidy-file* 'FILE'::
+    ploidy definition given as a space/tab-delimited list of
+    CHROM, FROM, TO, SEX, PLOIDY. The SEX codes are arbitrary and
+    correspond to the ones used by *<<samples_file,--samples-file>>*. 
+    The default ploidy can be given using the starred records (see
+    below), unlisted regions have ploidy 2. The default ploidy definition is
+----
+    X 1 60000 M 1
+    X 2699521 154931043 M 1
+    Y 1 59373566 M 1
+    Y 1 59373566 F 0
+    MT 1 16569 M 1
+    MT 1 16569 F 1
+    *  * *     M 2
+    *  * *     F 2
+----
 
 *-r, --regions* 'chr'|'chr:pos'|'chr:from-to'|'chr:from-'[,...]::
     see *<<common_options,Common Options>>*
@@ -1010,7 +1053,11 @@ For "vertical" merge take a look at *<<norm,bcftools norm>>* instead.
 
 *-i, --info-rules* '-'|'TAG:METHOD'[,...]::
     Rules for merging INFO fields (scalars or vectors) or '-' to disable the
-    default rules.  'METHOD' is one of 'sum', 'avg', 'min', 'max', 'join'.
+    default rules. 'METHOD' is one of 'sum', 'avg', 'min', 'max', 'join'.
+    Default is 'DP:sum,DP4:sum' if these fields exist in the input files.
+    Fields with no specified rule will take the value from the first input file.
+    The merged QUAL value is currently set to the maximum. This behaviour is 
+    not user controllable at the moment.
 
 *-l, --file-list* 'FILE'::
     read file names from 'FILE'
@@ -1042,9 +1089,10 @@ For "vertical" merge take a look at *<<norm,bcftools norm>>* instead.
 
 [[norm]]
 === bcftools norm ['OPTIONS'] 'file.vcf.gz'
-Left-align and normalize indels,  check if REF alleles match the reference,
+Left-align and normalize indels, check if REF alleles match the reference,
 split multiallelic sites into multiple rows; recover multiallelics from
-multiple rows.
+multiple rows. Left-alignment and normalization will only be applied if
+the *<<fasta_ref,--fasta-ref>>* option is supplied.
 
 *-c, --check-ref* 'e'|'w'|'x'|'s':: 
     what to do when incorrect or missing REF allele is encountered: 
@@ -1056,8 +1104,10 @@ multiple rows.
 *-D, --remove-duplicates*::
     remove duplicate lines of the same type
 
-*-f, --fasta-ref* 'FILE'::
-    reference sequence
+*-f, --fasta-ref* 'FILE'[[fasta_ref]]::
+    reference sequence. Supplying this option will turn on left-alignment
+    and normalization, however, see also the *<<do_not_normalize,--do-not-normalize>>*
+    option below.
 
 *-m, --multiallelics* <-|+>['snps'|'indels'|'both'|'any']::
     split multiallelic sites into biallelic records ('-') or join
@@ -1068,7 +1118,7 @@ multiple rows.
     'both'; if SNPs and indels should be merged into a single record, specify
     'any'.
 
-*-N, --do-not-normalize*::
+*-N, --do-not-normalize*[[do_not_normalize]]::
     the '-c s' option can be used to fix or set the REF allele from the 
     reference '-f'. The '-N' option will not turn on indel normalisation
     as the '-f' option normally implies
@@ -1599,14 +1649,14 @@ Convert between VCF and BCF. Former *bcftools subset*.
 *-P, --exclude-phased*::
     exclude sites where all samples are phased
 
-*-q, --min-af* 'FLOAT'[':nref'|':alt1'|':minor'|:'major'|:'nonmajor']::
+*-q, --min-af* 'FLOAT'[':nref'|':alt1'|':minor'|':major'|':nonmajor']::
     minimum allele frequency (INFO/AC / INFO/AN) of sites to be printed.
     Specifying the type of allele is optional and can be set to 
     non-reference ('nref', the default), 1st alternate  ('alt1'), the least 
     frequent ('minor'), the most frequent ('major') or sum of all but the 
     most frequent ('nonmajor') alleles.
 
-*-Q, --max-af* 'FLOAT'[':nref'|':alt1'|':minor'|:'major'|:'nonmajor']::
+*-Q, --max-af* 'FLOAT'[':nref'|':alt1'|':minor'|':major'|':nonmajor']::
     maximum allele frequency (INFO/AC / INFO/AN) of sites to be printed.
     Specifying the type of allele is optional and can be set to 
     non-reference ('nref', the default), 1st alternate  ('alt1'), the least 
@@ -1620,14 +1670,21 @@ Convert between VCF and BCF. Former *bcftools subset*.
     exclude sites without a called genotype
 
 *-v, --types* 'snps'|'indels'|'mnps'|'other'::
-    comma-separated list of variant types to select
+    comma-separated list of variant types to select. Site is selected if 
+    any of the ALT alleles is of the type requested. Types are determined 
+    by comparing the REF and ALT alleles in the VCF record not INFO tags 
+    like INFO/INDEL or INFO/VT. Use *--include* to select based on INFO 
+    tags.
 
 *-V, --exclude-types* 'snps'|'indels'|'mnps'|'other'::
-    comma-separated list of variant types to exclude
+    comma-separated list of variant types to exclude. Site is excluded if 
+    any of the ALT alleles is of the type requested. Types are determined 
+    by comparing the REF and ALT alleles in the VCF record not INFO tags 
+    like INFO/INDEL or INFO/VT. Use *--exclude* to exclude based on INFO tags.
 
 *-x, --private*::
     print sites where only the subset samples carry an non-reference allele.
-    Requires --samples or --samples-file.
+    Requires *--samples* or *--samples-file*.
 
 *-X, --exclude-private*::
     exclude sites where only the subset samples carry an non-reference allele

@@ -94,6 +94,7 @@ INSTALL_PROGRAM = $(INSTALL)
 INSTALL_DATA    = $(INSTALL) -m 644
 INSTALL_DIR     = $(MKDIR_P) -m 755
 
+MISC_PROGRAMS = plot-vcfstats vcfutils.pl plugins/color-chrs.pl
 
 all:$(PROG) libbcftools.a plugins libbcftools.so
 
@@ -142,6 +143,7 @@ call_h = call.h $(htslib_vcf_h) $(htslib_synced_bcf_reader_h) vcmp.h
 convert_h = convert.h $(htslib_vcf_h)
 tsv2vcf_h = tsv2vcf.h $(htslib_vcf_h)
 filter_h = filter.h $(htslib_vcf_h)
+ploidy_h = ploidy.h $(htslib_regidx_h)
 prob1_h = prob1.h $(htslib_vcf_h) $(call_h)
 roh_h = HMM.h $(htslib_vcf_h) $(htslib_synced_bcf_reader_h) $(HTSDIR)/htslib/kstring.h $(HTSDIR)/htslib/kseq.h $(bcftools_h)
 cnv_h = HMM.h $(htslib_vcf_h) $(htslib_synced_bcf_reader_h)
@@ -149,7 +151,7 @@ cnv_h = HMM.h $(htslib_vcf_h) $(htslib_synced_bcf_reader_h)
 main.o: main.c $(htslib_hts_h) version.h $(bcftools_h)
 vcfannotate.o: vcfannotate.c $(htslib_vcf_h) $(htslib_synced_bcf_reader_h) $(HTSDIR)/htslib/kseq.h $(bcftools_h) vcmp.h $(filter_h)
 vcfplugin.o: vcfplugin.c $(htslib_vcf_h) $(htslib_synced_bcf_reader_h) $(HTSDIR)/htslib/kseq.h $(bcftools_h) vcmp.h $(filter_h)
-vcfcall.o: vcfcall.c $(htslib_vcf_h) $(HTSDIR)/htslib/kfunc.h $(htslib_synced_bcf_reader_h) $(bcftools_h) $(call_h) $(prob1_h)
+vcfcall.o: vcfcall.c $(htslib_vcf_h) $(HTSDIR)/htslib/kfunc.h $(htslib_synced_bcf_reader_h) $(HTSDIR)/htslib/khash_str2int.h $(bcftools_h) $(call_h) $(prob1_h) $(ploidy_h)
 vcfconcat.o: vcfconcat.c $(htslib_vcf_h) $(htslib_synced_bcf_reader_h) $(HTSDIR)/htslib/kseq.h $(bcftools_h)
 vcfconvert.o: vcfconvert.c $(htslib_vcf_h) $(htslib_bgzf_h) $(htslib_synced_bcf_reader_h) $(htslib_vcfutils_h) $(bcftools_h) $(filter_h) $(convert_h) $(tsv2vcf_h)
 vcffilter.o: vcffilter.c $(htslib_vcf_h) $(htslib_synced_bcf_reader_h) $(htslib_vcfutils_h) $(bcftools_h) $(filter_h) rbuf.h
@@ -178,6 +180,7 @@ kmin.o: kmin.c kmin.h
 mcall.o: mcall.c $(HTSDIR)/htslib/kfunc.h $(call_h)
 prob1.o: prob1.c $(prob1_h)
 vcmp.o: vcmp.c $(htslib_hts_h) vcmp.h
+ploidy.o: ploidy.c $(htslib_regidx_h) $(HTSDIR)/htslib/khash_str2int.h $(HTSDIR)/htslib/kseq.h $(htslib_hts_h) $(bcftools_h) $(ploidy_h)
 polysomy.o: polysomy.c $(htslib_vcf_h) $(htslib_synced_bcf_reader_h) $(bcftools_h) peakfit.h
 peakfit.o: peakfit.c peakfit.h $(htslib_hts_h) $(HTSDIR)/htslib/kstring.h
 consensus.o: consensus.c $(htslib_hts_h) $(HTSDIR)/htslib/kseq.h rbuf.h $(bcftools_h) $(HTSDIR)/htslib/regidx.h
@@ -213,7 +216,7 @@ docs: doc/bcftools.1 doc/bcftools.html
 # make docs can be run to update if asciidoc is available
 install: $(PROG)
 	$(INSTALL_DIR) $(DESTDIR)$(bindir) $(DESTDIR)$(man1dir) $(DESTDIR)$(plugindir)
-	$(INSTALL_PROGRAM) $(PROG) plot-vcfstats vcfutils.pl $(DESTDIR)$(bindir)
+	$(INSTALL_PROGRAM) $(PROG) $(MISC_PROGRAMS) $(DESTDIR)$(bindir)
 	$(INSTALL_DATA) doc/bcftools.1 $(DESTDIR)$(man1dir)
 	$(INSTALL_PROGRAM) plugins/*.so $(DESTDIR)$(plugindir)
 
