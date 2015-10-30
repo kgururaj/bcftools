@@ -197,6 +197,7 @@ extern "C"
   typedef struct
   {
     uint8_t m_skip_coordinates;
+    uint8_t m_treat_deletions_as_intervals;
     unsigned m_htslib_buffer_size;
     buffer_wrapper m_csv_out_buffer;
     gvcf_stat_struct m_profile_intervals; //non-0 if profiling info to be collected

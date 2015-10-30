@@ -1234,8 +1234,27 @@ int write_csv_line(sqlite_mappings_struct* mapping_info, csv_output_struct* csv_
         {
             int num_elements = (*buffer_size)/sizeof(int);
             int num_values = bcf_get_info_values(out_hdr, line, "END", (void**)buffer, &num_elements, BCF_HT_INT);
+            //END not found, single position record
             if(num_values < 0)
-		global_end_position = position;
+            {
+                global_end_position = position;
+                if(csv_output_info->m_treat_deletions_as_intervals)
+                {
+                    //Check for deletions
+                    int j = 0;
+                    char** alleles = line->d.allele;
+                    int ref_length = strlen(alleles[0]);
+                    for(j=1;j<line->n_allele;++j)
+                    {
+                        if(bcf_get_variant_type(line, j) == VCF_INDEL
+                                && ref_length > strlen(alleles[j]))
+                        {
+                            global_end_position = position+ref_length-1;
+                            break;
+                        }
+                    }
+                }
+            }
             else
             {
                 int end_pos = ((int*)(*buffer))[0];
@@ -1454,6 +1473,7 @@ enum ArgsIdxEnum
   ARGS_IDX_TILEDB_OUTPUT_FORMAT,
   ARGS_IDX_TILEDB_OVERRIDE_SAMPLE_NAME,
   ARGS_IDX_TILEDB_ANCHOR_INTERVAL,
+  ARGS_IDX_TILEDB_TREAT_DELETIONS_AS_INTERVALS,
   ARGS_IDX_TAG
 };
 
@@ -1517,6 +1537,7 @@ int main_vcfview(int argc, char *argv[])
         {"tiledb-output-format",1,0,ARGS_IDX_TILEDB_OUTPUT_FORMAT},
         {"tiledb-override-sample-name",1,0,ARGS_IDX_TILEDB_OVERRIDE_SAMPLE_NAME},
         {"tiledb-anchor-interval",1,0,ARGS_IDX_TILEDB_ANCHOR_INTERVAL},
+        {"tiledb-treat-deletions-as-intervals",0,0,ARGS_IDX_TILEDB_TREAT_DELETIONS_AS_INTERVALS},
         {0,0,0,0}
     };
     char *tmp;
@@ -1662,6 +1683,9 @@ int main_vcfview(int argc, char *argv[])
                 break;
             case ARGS_IDX_TILEDB_ANCHOR_INTERVAL:
                 args->m_csv_output_info.m_tiledb_anchor_interval = strtoull(optarg, 0, 10);
+                break;
+            case ARGS_IDX_TILEDB_TREAT_DELETIONS_AS_INTERVALS:
+                args->m_csv_output_info.m_treat_deletions_as_intervals = 1;
                 break;
             case '?': usage(args);
             default: error("Unknown argument: %s\n", optarg);
